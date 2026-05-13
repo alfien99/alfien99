@@ -550,24 +550,123 @@ DEFAULT_CONFIG = {
 }
 
 
+def _ask(label: str, default: str, width: int = 24) -> str:
+    """Prompt the user; return default if they press Enter or input is non-interactive."""
+    try:
+        answer = input(f"  {label:<{width}} [{default}]: ").strip()
+        return answer if answer else default
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+
+
+def _parse_capital(raw: str) -> float:
+    cleaned = raw.replace(",", "").replace("$", "").replace("_", "").strip()
+    return float(cleaned)
+
+
+def _validate_date(s: str) -> str:
+    pd.Timestamp(s)   # raises ValueError on bad format
+    return s
+
+
+def _interactive_config(cfg: dict) -> dict:
+    """Ask the user for the four most-common settings; all others keep defaults."""
+    print("\n  Press Enter to accept the value shown in [ ].\n")
+
+    while True:
+        ticker = _ask("Ticker", cfg["ticker"]).upper()
+        if ticker:
+            break
+        print("  Ticker cannot be empty.")
+
+    while True:
+        start = _ask("Start date (YYYY-MM-DD)", cfg["start"])
+        try:
+            _validate_date(start)
+            break
+        except Exception:
+            print(f"  '{start}' is not a valid date — use YYYY-MM-DD format.")
+
+    while True:
+        end = _ask("End date   (YYYY-MM-DD)", cfg["end"])
+        try:
+            _validate_date(end)
+            if pd.Timestamp(end) > pd.Timestamp(start):
+                break
+            print("  End date must be after start date.")
+        except Exception:
+            print(f"  '{end}' is not a valid date — use YYYY-MM-DD format.")
+
+    while True:
+        cap_str = _ask("Starting capital ($)", f"{cfg['initial_capital']:,.0f}")
+        try:
+            cap = _parse_capital(cap_str)
+            if cap >= 100:
+                break
+            print("  Capital must be at least $100.")
+        except ValueError:
+            print(f"  '{cap_str}' is not a valid number.")
+
+    while True:
+        lb_str = _ask("VP lookback (bars)", str(cfg["lookback"]))
+        try:
+            lb = int(lb_str)
+            if lb >= 5:
+                break
+            print("  Lookback must be at least 5 bars.")
+        except ValueError:
+            print(f"  '{lb_str}' is not a valid integer.")
+
+    cfg = cfg.copy()
+    cfg["ticker"]          = ticker
+    cfg["start"]           = start
+    cfg["end"]             = end
+    cfg["initial_capital"] = cap
+    cfg["lookback"]        = lb
+    return cfg
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Volume Profile Strategy Backtester")
-    parser.add_argument("--ticker", default=DEFAULT_CONFIG["ticker"])
-    parser.add_argument("--start",  default=DEFAULT_CONFIG["start"])
-    parser.add_argument("--end",    default=DEFAULT_CONFIG["end"])
-    parser.add_argument("--capital", type=float, default=DEFAULT_CONFIG["initial_capital"])
-    parser.add_argument("--lookback", type=int,  default=DEFAULT_CONFIG["lookback"])
-    parser.add_argument("--out", default="backtest_results.png", help="Output image path")
+    parser = argparse.ArgumentParser(
+        description="Volume Profile Strategy Backtester",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "If run with no arguments an interactive prompt lets you set\n"
+            "ticker, dates, capital and lookback before the backtest starts.\n\n"
+            "Examples:\n"
+            "  python volume_profile_strategy.py\n"
+            "  python volume_profile_strategy.py --ticker AAPL --start 2020-01-01 --end 2025-01-01\n"
+            "  python volume_profile_strategy.py --ticker QQQ  --capital 50000 --lookback 10\n"
+        ),
+    )
+    parser.add_argument("--ticker",   default=None,  help="Ticker symbol (e.g. AAPL, QQQ, TSLA)")
+    parser.add_argument("--start",    default=None,  help="Start date YYYY-MM-DD")
+    parser.add_argument("--end",      default=None,  help="End date   YYYY-MM-DD")
+    parser.add_argument("--capital",  type=float, default=None, help="Starting capital in USD")
+    parser.add_argument("--lookback", type=int,   default=None, help="Rolling VP window in bars")
+    parser.add_argument("--out", default="backtest_results.png", help="Output chart path")
+    parser.add_argument("--no-prompt", action="store_true",
+                        help="Skip interactive prompt and use defaults / CLI args only")
     args = parser.parse_args()
 
     cfg = DEFAULT_CONFIG.copy()
-    cfg.update({
-        "ticker":          args.ticker,
-        "start":           args.start,
-        "end":             args.end,
-        "initial_capital": args.capital,
-        "lookback":        args.lookback,
-    })
+
+    # Apply any CLI overrides first
+    if args.ticker:   cfg["ticker"]          = args.ticker.upper()
+    if args.start:    cfg["start"]           = args.start
+    if args.end:      cfg["end"]             = args.end
+    if args.capital:  cfg["initial_capital"] = args.capital
+    if args.lookback: cfg["lookback"]        = args.lookback
+
+    # Show interactive prompt unless the user explicitly passed --no-prompt
+    # or supplied every key argument on the command line
+    cli_fully_specified = all([args.ticker, args.start, args.end, args.capital])
+    if not args.no_prompt and not cli_fully_specified:
+        print("\n╔══════════════════════════════════════════════════╗")
+        print("║   Volume Profile Strategy  —  Configuration      ║")
+        print("╚══════════════════════════════════════════════════╝")
+        cfg = _interactive_config(cfg)
 
     print("\nVolume Profile Strategy Backtester")
     print("=" * 50)
