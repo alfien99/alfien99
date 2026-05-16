@@ -389,6 +389,49 @@ def compute_stats(equity_df, initial_capital, trades_df):
             "Final Equity": f"${final:,.0f}"}
 
 
+# ── Buy-and-hold benchmark ─────────────────────────────────────────────────────
+
+def compute_bah(raw, initial_capital):
+    """
+    Simulate buy-and-hold over the full raw price series.
+    One market buy on bar 0, one market sell on the last bar.
+    Same commission + market slippage applied as the strategy uses.
+    Returns (equity_series, stats_dict).
+    """
+    entry_px  = buy_lim(float(raw["Close"].iloc[0]))
+    shares    = initial_capital / entry_px
+    # Mark-to-market: equity = shares × close, final bar net of exit costs
+    equity    = shares * raw["Close"].copy().astype(float)
+    exit_px   = sell_lim(float(raw["Close"].iloc[-1]))
+    equity.iloc[-1] = shares * exit_px
+
+    n_days    = max((raw.index[-1] - raw.index[0]).days, 1)
+    final     = float(equity.iloc[-1])
+    total_r   = (final - initial_capital) / initial_capital * 100
+    ann_r     = ((final / initial_capital) ** (365 / n_days) - 1) * 100
+    roll_max  = equity.cummax()
+    max_dd    = float(((equity - roll_max) / roll_max * 100).min())
+    daily_r   = equity.pct_change().dropna()
+    sharpe    = daily_r.mean() / daily_r.std() * 252**0.5 if daily_r.std() > 0 else 0.0
+    down      = daily_r[daily_r < 0]
+    sortino   = daily_r.mean() / down.std() * 252**0.5 if len(down) > 1 and down.std() > 0 else 0.0
+
+    stats = {
+        "Total Return": f"{total_r:+.1f}%",
+        "Ann. Return":  f"{ann_r:+.1f}%",
+        "Sharpe":       f"{sharpe:.2f}",
+        "Sortino":      f"{sortino:.2f}",
+        "Max Drawdown": f"{max_dd:.1f}%",
+        "Trades":       "1",
+        "Win Rate":     "100%" if total_r > 0 else "0%",
+        "Avg Win":      f"${final - initial_capital:,.0f}" if total_r > 0 else "—",
+        "Avg Loss":     "—" if total_r > 0 else f"${final - initial_capital:,.0f}",
+        "Final Equity": f"${final:,.0f}",
+        "_sharpe_raw":  sharpe,
+    }
+    return equity, stats
+
+
 # ── Plot ───────────────────────────────────────────────────────────────────────
 
 BG, GRID, FG   = "#0d1117", "#21262d", "#e6edf3"
@@ -405,13 +448,12 @@ def _style(ax):
 
 
 def plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df,
-                 flip_df, cfg, stats, is_synthetic=False,
-                 out="flip_long_results.png"):
-    # Fix 4: prepend loud synthetic label to every title element
+                 flip_df, cfg, stats, bah_equity=None, bah_stats=None,
+                 is_synthetic=False, out="flip_long_results.png"):
     synth_pfx = "[SYNTHETIC DATA — RESULTS NOT MEANINGFUL]\n" if is_synthetic else ""
 
-    fig = plt.figure(figsize=(20, 15), facecolor=BG)
-    gs  = GridSpec(4, 1, figure=fig, height_ratios=[3, 1, 1, 0.55], hspace=0.42)
+    fig = plt.figure(figsize=(20, 16), facecolor=BG)
+    gs  = GridSpec(4, 1, figure=fig, height_ratios=[3, 1, 1, 0.7], hspace=0.44)
     ax_p, ax_eq, ax_dd, ax_st = [fig.add_subplot(gs[i]) for i in range(4)]
     for ax in (ax_p, ax_eq, ax_dd, ax_st): _style(ax)
 
@@ -457,13 +499,22 @@ def plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df,
     ax_p.set_ylabel("Price ($)")
 
     eq = equity_df["equity"]
-    ax_eq.plot(eq.index, eq, color=GRN, lw=1.5)
+    ax_eq.plot(eq.index, eq, color=GRN, lw=1.8, label="Strategy", zorder=3)
     ax_eq.axhline(cfg["initial_capital"], color=FG, lw=0.7, ls="--", alpha=0.3)
     ax_eq.fill_between(eq.index, cfg["initial_capital"], eq,
                        where=eq >= cfg["initial_capital"], color=GRN, alpha=0.12)
     ax_eq.fill_between(eq.index, cfg["initial_capital"], eq,
                        where=eq <  cfg["initial_capital"], color=RED, alpha=0.12)
-    ax_eq.set_title(f"{synth_pfx}Equity Curve", fontsize=10,
+
+    # Section 2: buy-and-hold benchmark curve on same panel
+    if bah_equity is not None:
+        bah_scaled = bah_equity.reindex(eq.index, method="ffill")
+        bah_scaled = bah_scaled * (cfg["initial_capital"] / float(bah_equity.iloc[0]))
+        ax_eq.plot(bah_scaled.index, bah_scaled, color=BLUE, lw=1.2,
+                   ls="--", alpha=0.8, label="Buy-and-Hold", zorder=2)
+
+    ax_eq.legend(fontsize=8, facecolor=BG, labelcolor=FG, framealpha=0.8)
+    ax_eq.set_title(f"{synth_pfx}Equity Curve — Strategy vs Buy-and-Hold", fontsize=10,
                     color=RED if is_synthetic else FG)
     ax_eq.set_ylabel("Equity ($)")
 
@@ -474,12 +525,22 @@ def plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df,
     ax_dd.set_title("Drawdown (%)", fontsize=10); ax_dd.set_ylabel("DD %")
 
     ax_st.axis("off")
-    tbl = ax_st.table(cellText=[list(stats.values())], colLabels=list(stats.keys()),
+    # Section 2: two-row table — Strategy and Buy-and-Hold side by side
+    display_keys = ["Total Return", "Ann. Return", "Sharpe", "Sortino",
+                    "Max Drawdown", "Trades", "Win Rate", "Final Equity"]
+    col_labels = [""] + display_keys
+    strat_row  = ["Strategy"] + [stats.get(k, "—") for k in display_keys]
+    bah_row    = ["Buy-and-Hold"] + (
+        [bah_stats.get(k, "—") for k in display_keys] if bah_stats else ["—"] * len(display_keys))
+    tbl = ax_st.table(cellText=[strat_row, bah_row], colLabels=col_labels,
                       cellLoc="center", loc="center")
-    tbl.auto_set_font_size(False); tbl.set_fontsize(9); tbl.scale(1, 2.2)
+    tbl.auto_set_font_size(False); tbl.set_fontsize(8.5); tbl.scale(1, 2.0)
+    row_colors = {0: "#161b22", 1: BG, 2: "#0a1628"}
     for (r, c), cell in tbl.get_celld().items():
-        cell.set_facecolor("#161b22" if r == 0 else BG)
-        cell.set_edgecolor(GRID); cell.set_text_props(color=FG)
+        cell.set_facecolor(row_colors.get(r, BG))
+        cell.set_edgecolor(GRID)
+        lbl_color = GRN if r == 1 else (BLUE if r == 2 else FG)
+        cell.set_text_props(color=lbl_color)
 
     # Fix 4: synthetic prefix in suptitle
     base_title = ("Strategy 1: VAH→VAL Flip Long  —  "
@@ -547,6 +608,9 @@ def main():
 
     stats = compute_stats(equity_df, cfg["initial_capital"], trades_df)
 
+    # Section 2: buy-and-hold benchmark (same period, same costs)
+    bah_equity, bah_stats = compute_bah(raw, cfg["initial_capital"])
+
     # Fix 4: loud synthetic warning in printed output
     if is_synthetic:
         synth_line = "!" * 60
@@ -570,13 +634,40 @@ def main():
         print("\n  Exit breakdown:")
         print(trades_df["type"].value_counts().to_string(header=False))
 
+    # Section 2: side-by-side benchmark comparison table
+    cmp_keys = ["Total Return", "Ann. Return", "Sharpe", "Sortino", "Max Drawdown", "Final Equity"]
+    w = 22
+    print("\n" + "─" * (w + 16 + 16))
+    print(f"  {'Metric':<{w}} {'Strategy':>14} {'Buy-and-Hold':>14}")
+    print("─" * (w + 16 + 16))
+    for k in cmp_keys:
+        sv = stats.get(k, "—")
+        bv = bah_stats.get(k, "—")
+        print(f"  {k:<{w}} {sv:>14} {bv:>14}")
+    print("─" * (w + 16 + 16))
+
+    # Explicit underperformance / outperformance verdict
+    strat_sharpe = float(stats["Sharpe"])
+    bah_sharpe   = bah_stats.get("_sharpe_raw", 0.0)
+    print()
+    if strat_sharpe < bah_sharpe:
+        print(f"  ⚠  UNDERPERFORMS: Strategy Sharpe ({strat_sharpe:.2f}) < "
+              f"Buy-and-Hold Sharpe ({bah_sharpe:.2f}).")
+        print(f"     The strategy does not demonstrate edge over passive investing "
+              f"in this {'synthetic' if is_synthetic else 'period'}.")
+    else:
+        print(f"  ✓  OUTPERFORMS: Strategy Sharpe ({strat_sharpe:.2f}) > "
+              f"Buy-and-Hold Sharpe ({bah_sharpe:.2f}).")
+
     if is_synthetic:
         print("\n  *** SYNTHETIC RUN — do not use these results for trading decisions ***")
 
     print()
 
     plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df,
-                 flip_df, cfg, stats, is_synthetic=is_synthetic, out=args.out)
+                 flip_df, cfg, stats,
+                 bah_equity=bah_equity, bah_stats=bah_stats,
+                 is_synthetic=is_synthetic, out=args.out)
 
 
 if __name__ == "__main__":
