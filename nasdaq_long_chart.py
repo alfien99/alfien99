@@ -20,17 +20,13 @@ Usage
 import argparse
 import sys
 import warnings
+import webbrowser
 from pathlib import Path
 
-import matplotlib
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
-matplotlib.rcParams["figure.dpi"] = 110
 
 try:
     import yfinance as yf
@@ -346,176 +342,280 @@ def compute_stats(equity: np.ndarray, initial: float, trades: list) -> dict:
 
 
 # ── Chart ──────────────────────────────────────────────────────────────────────
+# ── Colour palette ────────────────────────────────────────────────────────────
 BG   = "#0d1117"
-GRID = "#21262d"
-FG   = "#e6edf3"
 BLUE = "#58a6ff"
 GRN  = "#3fb950"
 RED  = "#f85149"
 ORG  = "#ffa657"
 PRP  = "#bc8cff"
 YLW  = "#e3b341"
+GRID = "rgba(33,38,45,0.8)"
 
 
-def _style(ax):
-    ax.set_facecolor(BG)
-    ax.tick_params(colors=FG, labelsize=8)
-    for sp in ax.spines.values(): sp.set_edgecolor(GRID)
-    ax.xaxis.label.set_color(FG); ax.yaxis.label.set_color(FG)
-    ax.title.set_color(FG); ax.grid(color=GRID, alpha=0.5, lw=0.5)
-
-
+# ── Interactive Plotly chart ───────────────────────────────────────────────────
 def plot_chart(data: pd.DataFrame, levels: pd.DataFrame,
                entry_df: pd.DataFrame, exit_df: pd.DataFrame,
                equity: np.ndarray, trades: list,
                cfg: dict, stats: dict, tf: str,
-               out: str = "nasdaq_long_entries.png"):
-
-    from matplotlib.gridspec import GridSpec
-    from matplotlib.patches import FancyArrowPatch
+               out: str = "nasdaq_long_entries.html"):
+    """
+    Renders a fully interactive Plotly chart saved as HTML.
+    Scroll to zoom, drag to pan, double-click to reset, click legend to toggle.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
     sl = data.loc[levels.index]
-
-    fig = plt.figure(figsize=(22, 14), facecolor=BG)
-    gs  = GridSpec(3, 1, figure=fig,
-                   height_ratios=[4, 1.2, 0.55],
-                   hspace=0.38)
-    ax_p  = fig.add_subplot(gs[0])
-    ax_eq = fig.add_subplot(gs[1])
-    ax_st = fig.add_subplot(gs[2])
-    for ax in (ax_p, ax_eq, ax_st): _style(ax)
-
-    # ── Price + VP bands ─────────────────────────────────────────────────────
-    ax_p.plot(sl.index, sl["Close"], color=BLUE, lw=1.1, zorder=2, label="Price (Close)")
-    ax_p.fill_between(levels.index, levels["val"], levels["vah"],
-                      alpha=0.09, color=GRN, zorder=1)
-    ax_p.plot(levels.index, levels["val"], color=RED, lw=0.8, ls="--", alpha=0.85, label="VAL")
-    ax_p.plot(levels.index, levels["poc"], color=ORG, lw=0.8, ls="-",  alpha=0.85, label="POC")
-    ax_p.plot(levels.index, levels["vah"], color=GRN, lw=0.8, ls="--", alpha=0.85, label="VAH")
-    ax_p.plot(levels.index, levels["ext"], color=PRP, lw=0.6, ls=":",  alpha=0.5,  label="Extension")
-
-    # EMA
     ema = sl["Close"].ewm(span=cfg["ema_window"], adjust=False).mean()
-    ax_p.plot(sl.index, ema, color=YLW, lw=0.9, ls="--", alpha=0.65,
-              label=f"EMA({cfg['ema_window']}) trend filter")
 
-    # Highlight flip bars
-    flip_idx = levels.index[levels["flip"] & levels["uptrend"]]
-    for d in flip_idx:
-        if d in levels.index:
-            ax_p.axvspan(d, d, alpha=0.0)  # placeholder for potential shading
+    # Equity series aligned to levels index
+    eq_dates = levels.index[:len(equity)]
+    eq_s     = pd.Series(equity[:len(eq_dates)], index=eq_dates, dtype=float)
 
-    # ── Long entry markers — large green arrows with price labels ─────────────
+    n_entries = len(entry_df) if not entry_df.empty else 0
+    title = (f"Nasdaq 100 (QQQ) — VAH→VAL Flip Long  ·  {tf} candles  ·  "
+             f"VP {cfg['lookback']}-bar window  ·  {n_entries} long entries")
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.72, 0.28],
+        vertical_spacing=0.04,
+        subplot_titles=("", "Equity Curve ($)"),
+    )
+
+    # ── Candlesticks ──────────────────────────────────────────────────────────
+    fig.add_trace(go.Candlestick(
+        x=sl.index, open=sl["Open"], high=sl["High"],
+        low=sl["Low"], close=sl["Close"],
+        increasing_line_color=GRN, decreasing_line_color=RED,
+        increasing_fillcolor=GRN, decreasing_fillcolor=RED,
+        line_width=1, name="QQQ",
+        hovertext=[
+            f"O: {o:.2f}  H: {h:.2f}  L: {l:.2f}  C: {c:.2f}"
+            for o, h, l, c in zip(sl["Open"], sl["High"], sl["Low"], sl["Close"])
+        ],
+        hoverinfo="x+text",
+    ), row=1, col=1)
+
+    # ── Volume profile levels ─────────────────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=levels.index, y=levels["val"],
+        line=dict(color=RED, width=1.2, dash="dash"),
+        name="VAL", opacity=0.9,
+        hovertemplate="VAL: $%{y:.2f}<extra></extra>",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=levels.index, y=levels["poc"],
+        line=dict(color=ORG, width=1.2),
+        name="POC", opacity=0.9,
+        hovertemplate="POC: $%{y:.2f}<extra></extra>",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=levels.index, y=levels["vah"],
+        line=dict(color=GRN, width=1.2, dash="dash"),
+        name="VAH", opacity=0.9,
+        hovertemplate="VAH: $%{y:.2f}<extra></extra>",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=levels.index, y=levels["ext"],
+        line=dict(color=PRP, width=0.8, dash="dot"),
+        name="Extension target", opacity=0.6,
+        hovertemplate="Ext: $%{y:.2f}<extra></extra>",
+    ), row=1, col=1)
+
+    # Value area shading — fill between VAL and VAH
+    fig.add_trace(go.Scatter(
+        x=list(levels.index) + list(levels.index[::-1]),
+        y=list(levels["vah"]) + list(levels["val"][::-1]),
+        fill="toself",
+        fillcolor="rgba(63,185,80,0.07)",
+        line=dict(width=0),
+        name="Value Area",
+        showlegend=True,
+        hoverinfo="skip",
+    ), row=1, col=1)
+
+    # ── EMA trend filter ──────────────────────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=sl.index, y=ema,
+        line=dict(color=YLW, width=1.0, dash="dash"),
+        name=f"EMA({cfg['ema_window']}) trend filter",
+        opacity=0.7,
+        hovertemplate="EMA: $%{y:.2f}<extra></extra>",
+    ), row=1, col=1)
+
+    # ── Long entry markers ────────────────────────────────────────────────────
     if not entry_df.empty:
+        # Pin arrow tip to bar low, offset slightly below
+        bar_lows = []
+        for d in entry_df["date"]:
+            bar_lows.append(float(data.loc[d, "Low"]) if d in data.index
+                            else float(entry_df.loc[entry_df["date"] == d, "price"].iloc[0]))
         price_range = float(sl["High"].max() - sl["Low"].min())
-        arrow_offset = price_range * 0.025   # arrow sits this far below the bar low
+        offset      = price_range * 0.018
 
-        for _, r in entry_df.iterrows():
-            date  = r["date"]
-            price = r["price"]
-
-            # Find the bar's low for arrow anchor
-            bar_low = float(data.loc[date, "Low"]) if date in data.index else price
-            y_tail  = bar_low - arrow_offset * 1.8
-            y_head  = bar_low - arrow_offset * 0.3
-
-            # Arrow body
-            ax_p.annotate(
-                "",
-                xy=(date, y_head),
-                xytext=(date, y_tail),
-                arrowprops=dict(
-                    arrowstyle="->",
-                    color=GRN,
-                    lw=2.2,
-                    mutation_scale=18,
-                ),
-                zorder=8,
-            )
-
-            # Filled circle at arrowhead
-            ax_p.scatter(date, y_head, s=90, color=GRN,
-                         zorder=9, edgecolors="white", linewidths=0.8)
-
-            # Price label
-            ax_p.text(
-                date, y_tail - arrow_offset * 0.5,
-                f"${price:.1f}",
-                color=GRN, fontsize=7, ha="center", va="top",
-                fontweight="bold", zorder=10,
-                bbox=dict(boxstyle="round,pad=0.2", facecolor=BG,
-                          edgecolor=GRN, alpha=0.85, lw=0.8),
-            )
+        fig.add_trace(go.Scatter(
+            x=entry_df["date"],
+            y=[lo - offset for lo in bar_lows],
+            mode="markers+text",
+            marker=dict(
+                symbol="triangle-up",
+                size=14,
+                color=GRN,
+                line=dict(color="white", width=1),
+            ),
+            text=[f"${p:.1f}" for p in entry_df["price"]],
+            textposition="bottom center",
+            textfont=dict(color=GRN, size=9, family="monospace"),
+            name=f"Long entry ({n_entries})",
+            customdata=list(zip(
+                entry_df["price"],
+                entry_df.get("stop", [0]*n_entries),
+                entry_df.get("vah",  [0]*n_entries),
+            )),
+            hovertemplate=(
+                "<b>LONG ENTRY</b><br>"
+                "Fill:  $%{customdata[0]:.2f}<br>"
+                "Stop:  $%{customdata[1]:.2f}<br>"
+                "Target VAH: $%{customdata[2]:.2f}<br>"
+                "<extra></extra>"
+            ),
+        ), row=1, col=1)
 
     # ── Exit markers ─────────────────────────────────────────────────────────
     if not exit_df.empty:
-        ec = {"stop": RED, "poc": ORG, "vah": GRN, "ext": PRP}
-        em = {"stop": "x",  "poc": "D", "vah": "D", "ext": "D"}
-        es = {"stop": 100,  "poc": 60,  "vah": 60,  "ext": 60}
-        for _, r in exit_df.iterrows():
-            ax_p.scatter(r["date"], r["price"],
-                         marker=em.get(r["type"], "D"),
-                         s=es.get(r["type"], 60),
-                         color=ec.get(r["type"], FG),
-                         zorder=7, edgecolors="white", linewidths=0.7, alpha=0.9)
-
-    # Legend
-    legend_items = [
-        mpatches.Patch(color=BLUE, label="Price"),
-        mpatches.Patch(color=YLW,  label=f"EMA({cfg['ema_window']}) — only long above"),
-        mpatches.Patch(color=RED,  label="VAL  (long entry zone)"),
-        mpatches.Patch(color=ORG,  label="POC  (50% exit ◆)"),
-        mpatches.Patch(color=GRN,  label="VAH  (70% of remainder exit ◆)"),
-        mpatches.Patch(color=PRP,  label="Extension target ◆"),
-        mpatches.Patch(color=GRN,  label="▲ Long entry (limit at VAL)"),
-        mpatches.Patch(color=RED,  label="✕ Stop loss"),
-    ]
-    ax_p.legend(handles=legend_items, loc="upper left", fontsize=7.5,
-                facecolor=BG, labelcolor=FG, framealpha=0.9,
-                ncol=2, borderpad=0.8)
-
-    n_entries = len(entry_df) if not entry_df.empty else 0
-    ax_p.set_title(
-        f"Nasdaq 100 (QQQ) — VAH→VAL Flip Long  ·  {tf} candles  ·  "
-        f"{n_entries} long entries marked",
-        fontsize=12, fontweight="bold", pad=10,
-    )
-    ax_p.set_ylabel("Price ($)", fontsize=9)
+        exit_styles = {
+            "stop": dict(symbol="x",            color=RED, size=11, name="Stop loss"),
+            "poc":  dict(symbol="diamond",       color=ORG, size=9,  name="POC exit (50%)"),
+            "vah":  dict(symbol="diamond",       color=GRN, size=9,  name="VAH exit (70% rem.)"),
+            "ext":  dict(symbol="diamond",       color=PRP, size=9,  name="Extension exit"),
+        }
+        for etype, style in exit_styles.items():
+            sub = exit_df[exit_df["type"] == etype]
+            if sub.empty: continue
+            fig.add_trace(go.Scatter(
+                x=sub["date"], y=sub["price"],
+                mode="markers",
+                marker=dict(
+                    symbol=style["symbol"],
+                    size=style["size"],
+                    color=style["color"],
+                    line=dict(color="white", width=0.8),
+                ),
+                name=style["name"],
+                hovertemplate=f"<b>{style['name']}</b><br>$%{{y:.2f}}<extra></extra>",
+            ), row=1, col=1)
 
     # ── Equity curve ─────────────────────────────────────────────────────────
-    eq_dates = levels.index[:len(equity)]
-    eq_s     = pd.Series(equity[:len(eq_dates)], index=eq_dates)
-    ax_eq.plot(eq_s.index, eq_s, color=GRN, lw=1.5, label="Strategy equity")
-    ax_eq.axhline(cfg["initial_capital"], color=FG, lw=0.7, ls="--", alpha=0.3)
-    ax_eq.fill_between(eq_s.index, cfg["initial_capital"], eq_s,
-                       where=eq_s >= cfg["initial_capital"], color=GRN, alpha=0.12)
-    ax_eq.fill_between(eq_s.index, cfg["initial_capital"], eq_s,
-                       where=eq_s <  cfg["initial_capital"], color=RED, alpha=0.15)
-    ax_eq.set_title("Equity Curve", fontsize=9)
-    ax_eq.set_ylabel("Equity ($)", fontsize=8)
-    ax_eq.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    fig.add_trace(go.Scatter(
+        x=eq_s.index, y=eq_s,
+        line=dict(color=GRN, width=1.8),
+        fill="tozeroy",
+        fillcolor="rgba(63,185,80,0.10)",
+        name="Equity",
+        hovertemplate="$%{y:,.0f}<extra>Equity</extra>",
+    ), row=2, col=1)
 
-    # ── Stats table ───────────────────────────────────────────────────────────
-    ax_st.axis("off")
-    tbl = ax_st.table(
-        cellText=[list(stats.values())],
-        colLabels=list(stats.keys()),
-        cellLoc="center", loc="center",
+    fig.add_hline(
+        y=cfg["initial_capital"], row=2, col=1,
+        line=dict(color="rgba(230,237,243,0.3)", width=1, dash="dash"),
     )
-    tbl.auto_set_font_size(False); tbl.set_fontsize(10); tbl.scale(1, 2.4)
-    for (row, col), cell in tbl.get_celld().items():
-        cell.set_facecolor("#161b22" if row == 0 else BG)
-        cell.set_edgecolor(GRID); cell.set_text_props(color=FG)
 
-    plt.suptitle(
-        f"Nasdaq 100 — VAH→VAL Flip Long  ·  {tf} candles  ·  "
-        f"VP lookback {cfg['lookback']} bars  ·  "
-        f"Enter limit at VAL when value area steps up + EMA({cfg['ema_window']}) trend filter",
-        fontsize=10.5, color=FG, y=1.002, fontweight="bold",
+    # ── Stats annotation box ──────────────────────────────────────────────────
+    stats_text = "  ".join(f"<b>{k}</b> {v}" for k, v in stats.items())
+    fig.add_annotation(
+        xref="paper", yref="paper",
+        x=0.01, y=-0.04,
+        text=stats_text,
+        showarrow=False,
+        font=dict(size=11, color="#e6edf3", family="monospace"),
+        bgcolor="#161b22",
+        bordercolor="#21262d",
+        borderwidth=1,
+        borderpad=6,
+        align="left",
     )
-    plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=BG)
-    print(f"\n  Chart saved → {out}")
-    plt.show()
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14, color="#e6edf3"), x=0.01),
+        paper_bgcolor=BG,
+        plot_bgcolor=BG,
+        font=dict(color="#e6edf3", family="sans-serif"),
+        legend=dict(
+            bgcolor="rgba(22,27,34,0.9)",
+            bordercolor="#21262d",
+            borderwidth=1,
+            font=dict(size=11),
+            x=0.01, y=0.99,
+            xanchor="left", yanchor="top",
+            itemclick="toggle",
+            itemdoubleclick="toggleothers",
+        ),
+        hovermode="x unified",
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=60, r=30, t=60, b=100),
+    )
+
+    # Style both subplots
+    for row in (1, 2):
+        fig.update_xaxes(
+            showgrid=True, gridcolor=GRID, gridwidth=1,
+            zeroline=False,
+            showspikes=True, spikecolor="#58a6ff",
+            spikedash="dot", spikethickness=1,
+            row=row, col=1,
+        )
+        fig.update_yaxes(
+            showgrid=True, gridcolor=GRID, gridwidth=1,
+            zeroline=False,
+            tickprefix="$",
+            row=row, col=1,
+        )
+
+    # Price panel: zoom tools
+    fig.update_xaxes(
+        rangeselector=dict(
+            buttons=[
+                dict(count=5,  label="5d",  step="day",   stepmode="backward"),
+                dict(count=1,  label="1m",  step="month", stepmode="backward"),
+                dict(count=3,  label="3m",  step="month", stepmode="backward"),
+                dict(count=6,  label="6m",  step="month", stepmode="backward"),
+                dict(count=1,  label="1y",  step="year",  stepmode="backward"),
+                dict(step="all", label="All"),
+            ],
+            bgcolor="#161b22", activecolor="#21262d",
+            font=dict(color="#e6edf3"),
+        ),
+        row=1, col=1,
+    )
+
+    # Save
+    html_out = out if out.endswith(".html") else Path(out).with_suffix(".html").as_posix()
+    fig.write_html(
+        html_out,
+        include_plotlyjs="cdn",
+        config=dict(
+            scrollZoom=True,
+            displayModeBar=True,
+            modeBarButtonsToAdd=["drawline", "eraseshape"],
+            toImageButtonOptions=dict(
+                format="png", filename="nasdaq_long_chart", scale=2,
+            ),
+        ),
+    )
+    print(f"\n  Interactive chart → {html_out}")
+    print("  Open in your browser — scroll to zoom, drag to pan, "
+          "click legend to toggle traces.")
+    try:
+        webbrowser.open(f"file://{Path(html_out).resolve()}")
+    except Exception:
+        pass
 
 
 # ── Interactive prompt ─────────────────────────────────────────────────────────
@@ -635,8 +735,8 @@ def main():
                     help="Starting capital USD")
     ap.add_argument("--data",     default=None,
                     help="Path to local OHLCV CSV (bypasses yfinance)")
-    ap.add_argument("--out",      default="nasdaq_long_entries.png",
-                    help="Output chart filename")
+    ap.add_argument("--out",      default="nasdaq_long_entries.html",
+                    help="Output chart filename (.html = interactive, .png = static)")
     ap.add_argument("--no-prompt", action="store_true",
                     help="Skip interactive prompt, use CLI args / defaults")
     args = ap.parse_args()
@@ -696,8 +796,11 @@ def main():
         print(f"  {k:<16} {v}")
     print()
 
+    out = args.out
+    if not out.endswith((".html", ".png")):
+        out += ".html"
     plot_chart(data, levels, entry_df, exit_df, equity,
-               trades, cfg, stats, tf, out=args.out)
+               trades, cfg, stats, tf, out=out)
 
 
 if __name__ == "__main__":
