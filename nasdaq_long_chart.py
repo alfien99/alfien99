@@ -34,7 +34,7 @@ try:
 except ImportError:
     _YF = False
 
-TICKER = "QQQ"          # Nasdaq 100 ETF — proxy for US 100 / NQ
+TICKER = "NQ=F"         # Nasdaq 100 E-mini futures (continuous front-month)
 
 # ── Supported timeframes ───────────────────────────────────────────────────────
 TF_OPTIONS = ["1H", "2H", "4H", "1D", "1W"]
@@ -374,7 +374,7 @@ def plot_chart(data: pd.DataFrame, levels: pd.DataFrame,
     eq_s     = pd.Series(equity[:len(eq_dates)], index=eq_dates, dtype=float)
 
     n_entries = len(entry_df) if not entry_df.empty else 0
-    title = (f"Nasdaq 100 (QQQ) — VAH→VAL Flip Long  ·  {tf} candles  ·  "
+    title = (f"Nasdaq 100 Futures (NQ) — VAH→VAL Flip Long  ·  {tf} candles  ·  "
              f"VP {cfg['lookback']}-bar window  ·  {n_entries} long entries")
 
     fig = make_subplots(
@@ -391,7 +391,7 @@ def plot_chart(data: pd.DataFrame, levels: pd.DataFrame,
         low=sl["Low"], close=sl["Close"],
         increasing_line_color=GRN, decreasing_line_color=RED,
         increasing_fillcolor=GRN, decreasing_fillcolor=RED,
-        line_width=1, name="QQQ",
+        line_width=1, name="NQ Futures",
         hovertext=[
             f"O: {o:.2f}  H: {h:.2f}  L: {l:.2f}  C: {c:.2f}"
             for o, h, l, c in zip(sl["Open"], sl["High"], sl["Low"], sl["Close"])
@@ -756,7 +756,7 @@ def main():
             days=TF_DEFAULT_DAYS[cfg["tf"]])).isoformat()
 
     print("\n╔══════════════════════════════════════════════════════╗")
-    print("║  Nasdaq 100 — VAH→VAL Flip Long  (variable TF)      ║")
+    print("║  Nasdaq 100 Futures (NQ) — VAH→VAL Flip Long        ║")
     print("╚══════════════════════════════════════════════════════╝")
 
     cli_full = all([args.tf, args.start, args.end, args.capital])
@@ -764,7 +764,7 @@ def main():
         cfg = interactive_config(cfg)
 
     tf = cfg["tf"]
-    print(f"\n  Ticker    : QQQ  (Nasdaq 100)")
+    print(f"\n  Ticker    : NQ=F  (Nasdaq 100 E-mini Futures)")
     print(f"  Timeframe : {tf}")
     print(f"  Period    : {cfg['start']} → {cfg['end']}")
     print(f"  VP window : {cfg['lookback']} bars")
