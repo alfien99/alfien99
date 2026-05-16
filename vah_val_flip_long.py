@@ -35,6 +35,7 @@ Usage:
 
 import argparse
 import warnings
+from dataclasses import dataclass
 
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
@@ -139,29 +140,54 @@ def compute_vp(ohlcv, bins=100):
     return poc, mids[li], mids[hi_i], mids, vol
 
 
-# ── Backtest ───────────────────────────────────────────────────────────────────
+# ── Position dataclass (Section 3) ─────────────────────────────────────────────
 
-def run_backtest(cfg):
-    raw, is_synthetic = _download(cfg["ticker"], cfg["start"], cfg["end"])
+@dataclass
+class Position:
+    """All mutable state for one open position.  Reset in a single call."""
+    in_pos:   bool  = False
+    shares:   float = 0.0
+    avg_px:   float = 0.0
+    cost:     float = 0.0       # dollar basis still on the books
+    stop:     float = 0.0
+    poc:      float = 0.0
+    vah:      float = 0.0
+    ext:      float = 0.0
+    poc_done: bool  = False
+    vah_done: bool  = False
+
+    def reset(self):
+        self.__init__()         # re-apply dataclass defaults in one place
+
+
+# ── Stage 1: compute volume-profile levels per bar ─────────────────────────────
+
+def compute_levels(raw, cfg):
+    """
+    For every bar in `raw` (after the warm-up period), compute:
+      val, poc, vah       — current rolling VP
+      val_prev, vah_prev  — previous rolling VP (used for flip detection)
+      stop                — VAL × (1 - stop_pct)
+      ext                 — VAH + ext_mult × (VAH - POC)
+      ema                 — lagged EMA (look-ahead-free trend filter)
+      flip                — True when val_c > val_p AND val_c near/above vah_p
+
+    Returns a DataFrame indexed by bar date.
+    Also prints the EMA before/after comparison table (Section 1 Fix 1).
+    """
     lookback = cfg["lookback"]
     bins     = cfg["vp_bins"]
     tol      = cfg["flip_tolerance"]
-    buf      = cfg["entry_buffer"]
     stop_p   = cfg["stop_pct"]
     ema_win  = cfg["ema_window"]
-    capital  = float(cfg["initial_capital"])
 
-    # ── Fix 1: EMA look-ahead bias ────────────────────────────────────────────
-    # The unshifted EMA at bar i is computed using bar i's close, so checking
-    # close[i] > ema[i] is contaminated.  Shifting by 1 means bar i's trend
-    # filter uses the EMA value that was known BEFORE bar i opened.
     ema_raw    = raw["Close"].ewm(span=ema_win, adjust=False).mean()
     ema_lagged = ema_raw.shift(1)   # look-ahead-free
 
     min_i = max(lookback * 2, ema_win + 5)
 
-    # Print before/after comparison on three evenly-spaced sample bars
-    step = max((len(raw) - min_i) // 3, 1)
+    # Print EMA before/after for 3 sample bars
+    step    = max((len(raw) - min_i) // 3, 1)
     samples = [min_i, min_i + step, min_i + 2 * step]
     print("\n  EMA look-ahead fix — before vs. after (3 sample bars):")
     print(f"  {'Date':<12} {'Close':>10} {'EMA(orig)':>12} {'EMA(lag)':>12}"
@@ -180,159 +206,187 @@ def run_backtest(cfg):
         print(f"  {d:<12} {c:>10.2f} {e0:>12.2f} {e1:>12.2f} {t0:>10} {t1:>10}{changed}")
     print()
 
-    # ── Position state ────────────────────────────────────────────────────────
-    in_pos     = False
-    shares     = 0.0
-    avg_px     = 0.0
-    cost       = 0.0
-    entry_stop = 0.0
-    entry_poc  = 0.0
-    entry_vah  = 0.0
-    entry_ext  = 0.0
-    poc_done   = False
-    vah_done   = False
-
-    # ── Fix 2: Flip-consumed guard ────────────────────────────────────────────
-    # Once a trade is opened on a flip signal, further entries are suppressed
-    # until flip has been False for at least 3 consecutive bars.  This prevents
-    # re-entering the same stale regime after a stop-out.
-    flip_consumed       = False
-    flip_false_streak   = 0
-    suppressed_reentries = 0
-
-    # ── Fix 3: Stop slippage tracking ─────────────────────────────────────────
-    stop_exit_records = []   # (planned_price, realized_price, shares_exited)
-
-    equity_records = []
-    level_records  = []
-    trade_records  = []
-    entry_marks    = []
-    exit_marks     = []
-    flip_marks     = []
-
+    records = []
     for i in range(min_i, len(raw)):
-        date  = raw.index[i]
-        close = float(raw["Close"].iloc[i])
-        high  = float(raw["High"].iloc[i])
-        low   = float(raw["Low"].iloc[i])
-
-        poc_c, val_c, vah_c, _, _ = compute_vp(raw.iloc[i - lookback: i], bins)
+        poc_c, val_c, vah_c, _, _ = compute_vp(raw.iloc[i - lookback: i],          bins)
         poc_p, val_p, vah_p, _, _ = compute_vp(raw.iloc[i - lookback * 2: i - lookback], bins)
 
-        val_above_prev_val = val_c > val_p
-        near_prev_vah = (vah_p > 0 and abs(val_c - vah_p) / vah_p < tol) or val_c >= vah_p
-        flip = val_above_prev_val and near_prev_vah
-
-        # Fix 1: use lagged EMA value (no look-ahead)
         ema_val = ema_lagged.iloc[i]
-        uptrend = (not np.isnan(ema_val)) and close > float(ema_val)
+        ema_clean = float(ema_val) if not np.isnan(ema_val) else float(ema_raw.iloc[i])
 
-        stop_lvl = val_c * (1 - stop_p)
-        ext_lvl  = vah_c + cfg["ext_mult"] * (vah_c - poc_c)
+        val_above_prev = val_c > val_p
+        near_prev_vah  = (vah_p > 0 and abs(val_c - vah_p) / vah_p < tol) or val_c >= vah_p
+        flip = bool(val_above_prev and near_prev_vah)
 
-        level_records.append({"date": date, "poc": poc_c, "val": val_c,
-                               "vah": vah_c, "vah_prev": vah_p,
-                               "flip": flip, "ema": float(ema_lagged.iloc[i])
-                               if not np.isnan(ema_lagged.iloc[i]) else float(ema_raw.iloc[i])})
-        if flip:
-            flip_marks.append({"date": date, "level": val_c})
+        records.append({
+            "val":      val_c,  "poc":      poc_c,  "vah":      vah_c,
+            "val_prev": val_p,  "poc_prev": poc_p,  "vah_prev": vah_p,
+            "stop":     val_c * (1 - stop_p),
+            "ext":      vah_c + cfg["ext_mult"] * (vah_c - poc_c),
+            "ema":      ema_clean,
+            "ema_lag":  float(ema_val),   # may be NaN on the very first bar
+            "flip":     flip,
+        })
 
-        # Fix 2: update flip_false_streak and reset flip_consumed
-        if not flip:
+    return pd.DataFrame(records, index=raw.index[min_i:])
+
+
+# ── Stage 2: generate entry signals ────────────────────────────────────────────
+
+def generate_signals(raw, levels, cfg):
+    """
+    Given the per-bar levels produced by compute_levels(), return a DataFrame
+    of potential entry signals.  No position state: just which bars *could*
+    trigger an entry if the account is flat and the flip is fresh.
+
+    Columns:
+      flip          — raw flip boolean (before flip_consumed filter)
+      uptrend       — close > lagged EMA
+      entry_signal  — flip AND uptrend AND low touches limit AND close > stop
+      entry_limit   — limit order price (VAL × (1 + entry_buffer))
+      entry_price   — raw fill price (min(close, entry_limit)) when entry_signal
+    """
+    buf = cfg["entry_buffer"]
+    records = []
+    for date, lev in levels.iterrows():
+        bar   = raw.loc[date]
+        close = float(bar["Close"])
+        low   = float(bar["Low"])
+
+        uptrend     = bool(not np.isnan(lev["ema_lag"]) and close > lev["ema_lag"])
+        entry_limit = lev["val"] * (1 + buf)
+        raw_fill    = min(close, entry_limit)
+        signal      = bool(lev["flip"] and uptrend and low <= entry_limit and close > lev["stop"])
+
+        records.append({
+            "flip":         lev["flip"],
+            "uptrend":      uptrend,
+            "entry_signal": signal,
+            "entry_limit":  entry_limit,
+            "entry_price":  raw_fill if signal else float("nan"),
+        })
+    return pd.DataFrame(records, index=levels.index)
+
+
+# ── Stage 3: simulate trades ───────────────────────────────────────────────────
+
+def simulate_trades(raw, signals, levels, cfg):
+    """
+    Run the bar-by-bar simulation using pre-computed signals and levels.
+    Uses a Position dataclass instead of ten loose variables.
+    Applies the flip_consumed guard (Section 1 Fix 2).
+
+    Returns (trades_df, equity_df, entry_df, exit_df, suppressed_reentries).
+    """
+    capital  = float(cfg["initial_capital"])
+    pos      = Position()
+
+    flip_consumed        = False
+    flip_false_streak    = 0
+    suppressed_reentries = 0
+    stop_exit_records    = []   # (planned, realized, shares) for slippage report
+
+    trade_records = []
+    equity_records = []
+    entry_marks   = []
+    exit_marks    = []
+
+    for date in signals.index:
+        sig = signals.loc[date]
+        lev = levels.loc[date]
+        bar = raw.loc[date]
+        close = float(bar["Close"])
+        high  = float(bar["High"])
+        low   = float(bar["Low"])
+
+        # Update flip_consumed reset (needs ≥3 consecutive False bars)
+        if not sig["flip"]:
             flip_false_streak += 1
             if flip_false_streak >= 3:
-                flip_consumed = False        # new flip opportunity is clean
+                flip_consumed = False
         else:
-            flip_false_streak = 0            # streak broken; need 3 new False bars to reset
+            flip_false_streak = 0
 
         # ── Exits ─────────────────────────────────────────────────────────────
-        if in_pos:
-            # Fix 3: stop exit uses sell_stop (wider slippage under stress)
-            if low <= entry_stop:
-                realized = sell_stop(entry_stop)
-                stop_exit_records.append((entry_stop, realized, shares))
-                pnl = (realized - avg_px) * shares
-                capital += cost + pnl
+        if pos.in_pos:
+            if low <= pos.stop:
+                realized = sell_stop(pos.stop)
+                stop_exit_records.append((pos.stop, realized, pos.shares))
+                pnl = (realized - pos.avg_px) * pos.shares
+                capital += pos.cost + pnl
                 trade_records.append({"date": date, "type": "stop",
-                                      "entry": avg_px, "exit": realized, "pnl": pnl})
+                                      "entry": pos.avg_px, "exit": realized, "pnl": pnl})
                 exit_marks.append({"date": date, "price": realized, "type": "stop"})
-                in_pos = False; shares = cost = 0.0
-                poc_done = vah_done = False
+                pos.reset()
 
-            elif not poc_done and high >= entry_poc:
-                cs       = shares * cfg["poc_exit_frac"]
-                realized = sell_lim(entry_poc)
-                pnl_p    = (realized - avg_px) * cs
-                capital += cs * avg_px + pnl_p
-                cost    -= cs * avg_px
-                shares  -= cs
-                poc_done = True
+            elif not pos.poc_done and high >= pos.poc:
+                cs       = pos.shares * cfg["poc_exit_frac"]
+                realized = sell_lim(pos.poc)
+                pnl_p    = (realized - pos.avg_px) * cs
+                capital  += cs * pos.avg_px + pnl_p
+                pos.cost   -= cs * pos.avg_px
+                pos.shares -= cs
+                pos.poc_done = True
                 exit_marks.append({"date": date, "price": realized, "type": "poc"})
 
-            elif poc_done and not vah_done and high >= entry_vah:
-                cs       = shares * cfg["vah_exit_frac"]
-                realized = sell_lim(entry_vah)
-                pnl_p    = (realized - avg_px) * cs
-                capital += cs * avg_px + pnl_p
-                cost    -= cs * avg_px
-                shares  -= cs
-                vah_done = True
+            elif pos.poc_done and not pos.vah_done and high >= pos.vah:
+                cs       = pos.shares * cfg["vah_exit_frac"]
+                realized = sell_lim(pos.vah)
+                pnl_p    = (realized - pos.avg_px) * cs
+                capital  += cs * pos.avg_px + pnl_p
+                pos.cost   -= cs * pos.avg_px
+                pos.shares -= cs
+                pos.vah_done = True
                 exit_marks.append({"date": date, "price": realized, "type": "vah"})
 
-            elif vah_done and shares > 0 and high >= entry_ext:
-                realized = sell_lim(entry_ext)
-                pnl      = (realized - avg_px) * shares
-                capital += cost + pnl
+            elif pos.vah_done and pos.shares > 0 and high >= pos.ext:
+                realized = sell_lim(pos.ext)
+                pnl      = (realized - pos.avg_px) * pos.shares
+                capital  += pos.cost + pnl
                 trade_records.append({"date": date, "type": "target",
-                                      "entry": avg_px, "exit": realized, "pnl": pnl})
+                                      "entry": pos.avg_px, "exit": realized, "pnl": pnl})
                 exit_marks.append({"date": date, "price": realized, "type": "ext"})
-                in_pos = False; shares = cost = 0.0
-                poc_done = vah_done = False
+                pos.reset()
 
         # ── Entry ─────────────────────────────────────────────────────────────
-        # Limit order at VAL*(1+buf); filled when bar's low touches that level.
-        entry_limit = val_c * (1 + buf)
-        # Fix 2: also gate on flip_consumed to block same-regime re-entries
-        can_enter = not in_pos and flip and not flip_consumed and uptrend and low <= entry_limit and close > stop_lvl
-        suppressed = not in_pos and flip and flip_consumed and uptrend and low <= entry_limit and close > stop_lvl
+        can_enter  = not pos.in_pos and sig["entry_signal"] and not flip_consumed
+        suppressed = not pos.in_pos and sig["entry_signal"] and flip_consumed
 
         if suppressed:
             suppressed_reentries += 1
 
         if can_enter:
-            raw_fill   = min(close, entry_limit)
-            fill_px    = buy_lim(raw_fill)          # Fix 3: entry cost includes commission+slippage
-            risk_per_sh = max(fill_px - sell_stop(stop_lvl), 1e-6)  # round-trip risk to stop
-            risk_cash  = capital * cfg["risk_pct"]
-            n_sh       = risk_cash / risk_per_sh
-            order_cash = min(n_sh * fill_px, capital * cfg["max_position_pct"])
+            fill_px     = buy_lim(sig["entry_price"])
+            risk_per_sh = max(fill_px - sell_stop(lev["stop"]), 1e-6)
+            n_sh        = capital * cfg["risk_pct"] / risk_per_sh
+            order_cash  = min(n_sh * fill_px, capital * cfg["max_position_pct"])
 
             if order_cash >= 50 and capital >= order_cash:
-                shares     = n_sh
-                avg_px     = fill_px
-                cost       = order_cash
-                entry_stop = stop_lvl
-                entry_poc  = poc_c
-                entry_vah  = vah_c
-                entry_ext  = ext_lvl
-                poc_done   = vah_done = False
-                in_pos     = True
-                flip_consumed = True             # Fix 2: mark this flip as consumed
-                capital   -= order_cash
+                pos.in_pos   = True
+                pos.shares   = n_sh
+                pos.avg_px   = fill_px
+                pos.cost     = order_cash
+                pos.stop     = lev["stop"]
+                pos.poc      = lev["poc"]
+                pos.vah      = lev["vah"]
+                pos.ext      = lev["ext"]
+                pos.poc_done = pos.vah_done = False
+                flip_consumed = True
+                capital      -= order_cash
                 entry_marks.append({"date": date, "price": fill_px})
 
-        equity_records.append({"date": date, "equity": capital + shares * close})
+        equity_records.append({"date": date, "equity": capital + pos.shares * close})
 
     # Close any open position at final bar
-    if in_pos and shares > 0:
-        lp  = float(raw["Close"].iloc[-1])
+    if pos.in_pos and pos.shares > 0:
+        lp       = float(raw["Close"].iloc[-1])
         realized = sell_lim(lp)
-        pnl = (realized - avg_px) * shares
-        capital += cost + pnl
+        pnl      = (realized - pos.avg_px) * pos.shares
+        capital  += pos.cost + pnl
         trade_records.append({"date": raw.index[-1], "type": "expired",
-                               "entry": avg_px, "exit": realized, "pnl": pnl})
+                               "entry": pos.avg_px, "exit": realized, "pnl": pnl})
 
-    # ── Fix 3: stop slippage report ───────────────────────────────────────────
+    # ── Reports ───────────────────────────────────────────────────────────────
     n_stops = len(stop_exit_records)
     print(f"  Stop exits     : {n_stops}")
     if n_stops > 0:
@@ -344,20 +398,29 @@ def run_backtest(cfg):
         print(f"  Realized slippage (sell_stop): {realized_pct:.3f}% per stop exit")
         print(f"  Extra cost from stop slippage: ${extra_costs:,.2f}")
     else:
-        print(f"  (no stop exits — slippage comparison not applicable)")
-
-    # ── Fix 2: suppressed re-entry report ─────────────────────────────────────
+        print("  (no stop exits — slippage comparison not applicable)")
     print(f"  Suppressed re-entries (flip_consumed guard): {suppressed_reentries}")
 
     equity_df = pd.DataFrame(equity_records).set_index("date")
-    levels_df = pd.DataFrame(level_records).set_index("date")
     trades_df = (pd.DataFrame(trade_records)
                  if trade_records else pd.DataFrame(columns=["pnl", "type"]))
-    entry_df  = pd.DataFrame(entry_marks) if entry_marks  else pd.DataFrame()
-    exit_df   = pd.DataFrame(exit_marks)  if exit_marks   else pd.DataFrame()
-    flip_df   = pd.DataFrame(flip_marks)  if flip_marks   else pd.DataFrame()
-    return (raw, trades_df, equity_df, levels_df, entry_df, exit_df, flip_df,
-            is_synthetic, suppressed_reentries)
+    entry_df  = pd.DataFrame(entry_marks) if entry_marks else pd.DataFrame()
+    exit_df   = pd.DataFrame(exit_marks)  if exit_marks  else pd.DataFrame()
+    return trades_df, equity_df, entry_df, exit_df, suppressed_reentries
+
+
+# ── Thin orchestrator ──────────────────────────────────────────────────────────
+
+def run_backtest(cfg):
+    """Download data then run the three-stage pipeline."""
+    raw, is_synthetic = _download(cfg["ticker"], cfg["start"], cfg["end"])
+    levels  = compute_levels(raw, cfg)
+    signals = generate_signals(raw, levels, cfg)
+    trades_df, equity_df, entry_df, exit_df, suppressed = simulate_trades(
+        raw, signals, levels, cfg)
+    # levels already has 'flip' and 'ema' columns that plot_results needs
+    return (raw, trades_df, equity_df, levels, entry_df, exit_df,
+            pd.DataFrame(), is_synthetic, suppressed)
 
 
 # ── Stats ──────────────────────────────────────────────────────────────────────
