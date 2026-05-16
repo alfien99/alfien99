@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Volume Profile Trading Strategy Backtester
+Volume Profile Trading Strategy Backtester  —  Bidirectional VAL/VAH
 
 Strategy rules:
-  Entry  — Long when daily close drops below the rolling VAL (Value Area Low).
-            Position size scales up with distance below VAL:
-            each successive 1% further away triggers a larger add.
-  Exits  — 50% of position closed at POC (Point of Control)
-            70% of remainder closed at VAH (Value Area High)
-            Remaining ~15% closed above VAH (VAH + 1× VAH–POC extension)
-  Stop   — Fixed 3% below entry VAL
+  LONG  — Enter when daily close drops below rolling VAL.
+           Scale up every cfg["scale_step_pct"] further below VAL.
+           Exit: 50% at POC  →  70% of remainder at VAH  →  rest at VAH + extension.
+           Stop: cfg["stop_pct"] below entry VAL.
+
+  SHORT — Enter when daily close rises above rolling VAH.
+           Scale up every cfg["scale_step_pct"] further above VAH.
+           Exit: 50% at POC  →  70% of remainder at VAL  →  rest at VAL − extension.
+           Stop: cfg["stop_pct"] above entry VAH.
 
 Usage:
   pip install yfinance matplotlib pandas numpy
@@ -43,25 +45,22 @@ def _synthetic_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:
     with mild mean reversion and clustered volatility regimes.
     Used as a fallback when Yahoo Finance is unreachable (e.g. offline/CI).
     """
-    rng    = np.random.default_rng(abs(hash(ticker)) % (2**31))
-    dates  = pd.bdate_range(start, end)
-    n      = len(dates)
+    rng   = np.random.default_rng(abs(hash(ticker)) % (2**31))
+    dates = pd.bdate_range(start, end)
+    n     = len(dates)
 
-    # Drift and volatility parameters
-    mu      = 0.0003    # ~7.5 % annual drift
-    sigma   = 0.012     # ~19 % annual vol
-    S0      = 450.0
+    mu    = 0.0003
+    sigma = 0.012
+    S0    = 450.0
 
-    # Volatility regimes (GARCH-lite)
     vols = np.full(n, sigma)
     for i in range(1, n):
-        shock  = abs(rng.standard_normal())
+        shock   = abs(rng.standard_normal())
         vols[i] = 0.92 * vols[i-1] + 0.08 * sigma * shock + 0.001
 
     log_ret = rng.standard_normal(n) * vols + mu
     closes  = S0 * np.exp(np.cumsum(log_ret))
 
-    # Build OHLC from close
     hl_range = closes * vols * 2.2
     highs    = closes + hl_range * rng.uniform(0.3, 0.7, n)
     lows     = closes - hl_range * rng.uniform(0.3, 0.7, n)
@@ -142,14 +141,13 @@ def compute_vp(ohlcv: pd.DataFrame, bins: int = 100):
     poc_idx = int(np.argmax(vol))
     poc     = mids[poc_idx]
 
-    # Expand from POC symmetrically until 70 % of total volume is captured
     total  = vol.sum()
     target = total * 0.70
     li = hi_i = poc_idx
     acc = vol[poc_idx]
 
     while acc < target:
-        add_lo = vol[li - 1]   if li   > 0       else -1.0
+        add_lo = vol[li - 1]   if li   > 0        else -1.0
         add_hi = vol[hi_i + 1] if hi_i < bins - 1 else -1.0
         if add_lo < 0 and add_hi < 0:
             break
@@ -165,32 +163,36 @@ def compute_vp(ohlcv: pd.DataFrame, bins: int = 100):
 
 # ── Back-test ──────────────────────────────────────────────────────────────────
 
+def _blank_pos(n_tranches):
+    return dict(
+        in_pos=False,
+        shares=0.0,
+        avg=0.0,
+        cost=0.0,
+        entry_level=0.0,   # VAL for long, VAH for short
+        entry_poc=0.0,
+        entry_exit1=0.0,   # VAH for long, VAL for short
+        entry_stop=0.0,
+        entry_ext=0.0,     # above-VAH target for long, below-VAL target for short
+        poc_done=False,
+        exit1_done=False,
+        tranches_done=[False] * n_tranches,
+    )
+
+
 def run_backtest(cfg: dict):
     raw = _download(cfg["ticker"], cfg["start"], cfg["end"])
 
     if len(raw) < cfg["lookback"] + 5:
         sys.exit("Not enough data — try a longer date range.")
 
-    lookback = cfg["lookback"]
-    capital  = float(cfg["initial_capital"])
+    lookback     = cfg["lookback"]
+    capital      = float(cfg["initial_capital"])
+    n_tranches   = cfg["max_scales"] + 1
 
-    # ── Position state ──
-    in_pos        = False
-    pos_shares    = 0.0
-    pos_avg       = 0.0      # average entry price
-    pos_cost      = 0.0      # total cash deployed (used for accounting)
-    entry_val     = 0.0
-    entry_poc     = 0.0
-    entry_vah     = 0.0
-    entry_stop    = 0.0
-    entry_above   = 0.0
-    poc_done      = False
-    vah_done      = False
-    # One boolean per scale tranche (0 = base entry, 1..max_scales = scale-ins)
-    n_tranches    = cfg["max_scales"] + 1
-    tranches_done = [False] * n_tranches
+    long_pos  = _blank_pos(n_tranches)
+    short_pos = _blank_pos(n_tranches)
 
-    # ── Output containers ──
     equity_records = []
     level_records  = []
     trade_records  = []
@@ -204,129 +206,196 @@ def run_backtest(cfg: dict):
         low   = float(raw["Low"].iloc[i])
 
         poc, val, vah, _mids, _vpvol = compute_vp(raw.iloc[i - lookback: i], cfg["vp_bins"])
-        stop  = val  * (1 - cfg["stop_pct"])
-        above = vah  + cfg["above_vah_ext"] * (vah - poc)
+        long_stop  = val * (1 - cfg["stop_pct"])
+        short_stop = vah * (1 + cfg["stop_pct"])
+        long_ext   = vah + cfg["above_vah_ext"] * (vah - poc)
+        short_ext  = val - cfg["above_vah_ext"] * (poc - val)
 
         level_records.append({"date": date, "poc": poc, "val": val,
-                               "vah": vah, "above": above})
+                               "vah": vah, "long_ext": long_ext, "short_ext": short_ext})
 
-        stopped_today = False
+        long_stopped  = False
+        short_stopped = False
 
-        # ── Exit logic ──────────────────────────────────────────────────────
-        if in_pos:
+        # ── LONG exits ──────────────────────────────────────────────────────
+        lp = long_pos
+        if lp["in_pos"]:
+            if low <= lp["entry_stop"]:
+                pnl      = (lp["entry_stop"] - lp["avg"]) * lp["shares"]
+                capital += lp["cost"] + pnl
+                trade_records.append({"date": date, "side": "long", "type": "stop",
+                                      "entry": lp["avg"], "exit": lp["entry_stop"], "pnl": pnl})
+                exit_markers.append({"date": date, "price": lp["entry_stop"], "type": "long_stop"})
+                long_pos     = _blank_pos(n_tranches)
+                long_stopped = True
 
-            # Stop loss  (checked first — most conservative bar assumption)
-            if low <= entry_stop:
-                pnl = (entry_stop - pos_avg) * pos_shares
-                capital += pos_cost + pnl
-                trade_records.append({
-                    "date": date, "type": "stop",
-                    "entry": pos_avg, "exit": entry_stop, "pnl": pnl,
-                })
-                exit_markers.append({"date": date, "price": entry_stop, "type": "stop"})
-                in_pos        = False
-                pos_shares    = pos_cost = 0.0
-                poc_done      = vah_done = False
-                tranches_done = [False] * n_tranches
-                stopped_today = True
+            elif not lp["poc_done"] and high >= lp["entry_poc"]:
+                close_sh        = lp["shares"] * cfg["poc_exit_frac"]
+                pnl_p           = (lp["entry_poc"] - lp["avg"]) * close_sh
+                capital        += close_sh * lp["avg"] + pnl_p
+                lp["cost"]     -= close_sh * lp["avg"]
+                lp["shares"]   -= close_sh
+                lp["poc_done"]  = True
+                exit_markers.append({"date": date, "price": lp["entry_poc"], "type": "long_poc"})
 
-            # Partial exit at POC — 50 % of remaining shares
-            elif not poc_done and high >= entry_poc:
-                close_sh  = pos_shares * cfg["poc_exit_frac"]
-                pnl_p     = (entry_poc - pos_avg) * close_sh
-                capital  += close_sh * pos_avg + pnl_p
-                pos_cost -= close_sh * pos_avg
-                pos_shares -= close_sh
-                poc_done  = True
-                exit_markers.append({"date": date, "price": entry_poc, "type": "poc"})
+            elif lp["poc_done"] and not lp["exit1_done"] and high >= lp["entry_exit1"]:
+                close_sh          = lp["shares"] * cfg["vah_exit_frac"]
+                pnl_p             = (lp["entry_exit1"] - lp["avg"]) * close_sh
+                capital          += close_sh * lp["avg"] + pnl_p
+                lp["cost"]       -= close_sh * lp["avg"]
+                lp["shares"]     -= close_sh
+                lp["exit1_done"]  = True
+                exit_markers.append({"date": date, "price": lp["entry_exit1"], "type": "long_vah"})
 
-            # Partial exit at VAH — 70 % of remaining (≈ 35 % of original)
-            elif poc_done and not vah_done and high >= entry_vah:
-                close_sh   = pos_shares * cfg["vah_exit_frac"]
-                pnl_p      = (entry_vah - pos_avg) * close_sh
-                capital   += close_sh * pos_avg + pnl_p
-                pos_cost  -= close_sh * pos_avg
-                pos_shares -= close_sh
-                vah_done   = True
-                exit_markers.append({"date": date, "price": entry_vah, "type": "vah"})
+            elif lp["exit1_done"] and lp["shares"] > 0 and high >= lp["entry_ext"]:
+                pnl      = (lp["entry_ext"] - lp["avg"]) * lp["shares"]
+                capital += lp["cost"] + pnl
+                trade_records.append({"date": date, "side": "long", "type": "target",
+                                      "entry": lp["avg"], "exit": lp["entry_ext"], "pnl": pnl})
+                exit_markers.append({"date": date, "price": lp["entry_ext"], "type": "long_ext"})
+                long_pos = _blank_pos(n_tranches)
 
-            # Final exit above VAH — remaining ~15 % of original
-            elif vah_done and pos_shares > 0 and high >= entry_above:
-                pnl      = (entry_above - pos_avg) * pos_shares
-                capital += pos_cost + pnl
-                trade_records.append({
-                    "date": date, "type": "target",
-                    "entry": pos_avg, "exit": entry_above, "pnl": pnl,
-                })
-                exit_markers.append({"date": date, "price": entry_above, "type": "above"})
-                in_pos        = False
-                pos_shares    = pos_cost = 0.0
-                poc_done      = vah_done = False
-                tranches_done = [False] * n_tranches
+        # ── SHORT exits ─────────────────────────────────────────────────────
+        sp = short_pos
+        if sp["in_pos"]:
+            if high >= sp["entry_stop"]:
+                pnl      = (sp["avg"] - sp["entry_stop"]) * sp["shares"]
+                capital += sp["cost"] + pnl
+                trade_records.append({"date": date, "side": "short", "type": "stop",
+                                      "entry": sp["avg"], "exit": sp["entry_stop"], "pnl": pnl})
+                exit_markers.append({"date": date, "price": sp["entry_stop"], "type": "short_stop"})
+                short_pos     = _blank_pos(n_tranches)
+                short_stopped = True
 
-        # ── Entry / scale-in logic ───────────────────────────────────────────
-        if close < val and not stopped_today:
-            equity = capital + pos_shares * close
+            elif not sp["poc_done"] and low <= sp["entry_poc"]:
+                close_sh        = sp["shares"] * cfg["poc_exit_frac"]
+                pnl_p           = (sp["avg"] - sp["entry_poc"]) * close_sh
+                capital        += close_sh * sp["avg"] + pnl_p
+                sp["cost"]     -= close_sh * sp["avg"]
+                sp["shares"]   -= close_sh
+                sp["poc_done"]  = True
+                exit_markers.append({"date": date, "price": sp["entry_poc"], "type": "short_poc"})
+
+            elif sp["poc_done"] and not sp["exit1_done"] and low <= sp["entry_exit1"]:
+                close_sh          = sp["shares"] * cfg["vah_exit_frac"]
+                pnl_p             = (sp["avg"] - sp["entry_exit1"]) * close_sh
+                capital          += close_sh * sp["avg"] + pnl_p
+                sp["cost"]       -= close_sh * sp["avg"]
+                sp["shares"]     -= close_sh
+                sp["exit1_done"]  = True
+                exit_markers.append({"date": date, "price": sp["entry_exit1"], "type": "short_val"})
+
+            elif sp["exit1_done"] and sp["shares"] > 0 and low <= sp["entry_ext"]:
+                pnl      = (sp["avg"] - sp["entry_ext"]) * sp["shares"]
+                capital += sp["cost"] + pnl
+                trade_records.append({"date": date, "side": "short", "type": "target",
+                                      "entry": sp["avg"], "exit": sp["entry_ext"], "pnl": pnl})
+                exit_markers.append({"date": date, "price": sp["entry_ext"], "type": "short_ext"})
+                short_pos = _blank_pos(n_tranches)
+
+        # ── LONG entries / scale-ins ─────────────────────────────────────────
+        if close < val and not long_stopped and not long_pos["in_pos"] or \
+           (close < val and not long_stopped and long_pos["in_pos"]):
+            lp     = long_pos
+            equity = capital + lp["shares"] * close
 
             for t in range(n_tranches):
-                if tranches_done[t]:
+                if lp["tranches_done"][t]:
                     continue
-
-                # Reference VAL: use the VAL at entry for existing position
-                ref_val   = entry_val if in_pos else val
+                ref_val   = lp["entry_level"] if lp["in_pos"] else val
                 threshold = ref_val * (1.0 - t * cfg["scale_step_pct"])
-
                 if close > threshold:
-                    continue    # haven't fallen far enough for this tranche yet
+                    continue
 
                 size_pct   = cfg["base_risk_pct"] * (cfg["scale_factor"] ** t)
                 order_cash = equity * size_pct
-
                 if order_cash < 50 or capital < order_cash:
-                    tranches_done[t] = True   # skip — insufficient capital
+                    lp["tranches_done"][t] = True
                     continue
 
                 new_shares = order_cash / close
-
-                if not in_pos:
-                    pos_avg    = close
-                    pos_shares = new_shares
-                    pos_cost   = order_cash
-                    entry_val  = val
-                    entry_poc  = poc
-                    entry_vah  = vah
-                    entry_stop = stop
-                    entry_above= above
-                    poc_done   = False
-                    vah_done   = False
-                    in_pos     = True
+                if not lp["in_pos"]:
+                    lp["avg"]         = close
+                    lp["shares"]      = new_shares
+                    lp["cost"]        = order_cash
+                    lp["entry_level"] = val
+                    lp["entry_poc"]   = poc
+                    lp["entry_exit1"] = vah
+                    lp["entry_stop"]  = long_stop
+                    lp["entry_ext"]   = long_ext
+                    lp["poc_done"]    = False
+                    lp["exit1_done"]  = False
+                    lp["in_pos"]      = True
                 else:
-                    # Weighted average entry price
-                    total_cost  = pos_cost + order_cash
-                    pos_avg     = (pos_avg * pos_shares + close * new_shares) / (pos_shares + new_shares)
-                    pos_shares += new_shares
-                    pos_cost    = total_cost
+                    total_cost  = lp["cost"] + order_cash
+                    lp["avg"]   = (lp["avg"] * lp["shares"] + close * new_shares) / (lp["shares"] + new_shares)
+                    lp["shares"] += new_shares
+                    lp["cost"]   = total_cost
 
                 capital -= order_cash
-                tranches_done[t] = True
-                entry_markers.append({"date": date, "price": close, "level": t})
+                lp["tranches_done"][t] = True
+                entry_markers.append({"date": date, "price": close, "level": t, "side": "long"})
 
-        equity_records.append({"date": date, "equity": capital + pos_shares * close})
+        # ── SHORT entries / scale-ins ────────────────────────────────────────
+        if cfg.get("enable_short", True) and close > vah and not short_stopped:
+            sp     = short_pos
+            equity = capital + (sp["shares"] * sp["avg"] if sp["in_pos"] else 0)
 
-    # Close any open position at last close price
-    if in_pos and pos_shares > 0:
-        lp  = float(raw["Close"].iloc[-1])
-        pnl = (lp - pos_avg) * pos_shares
-        capital += pos_cost + pnl
-        trade_records.append({
-            "date": raw.index[-1], "type": "expired",
-            "entry": pos_avg, "exit": lp, "pnl": pnl,
-        })
+            for t in range(n_tranches):
+                if sp["tranches_done"][t]:
+                    continue
+                ref_vah   = sp["entry_level"] if sp["in_pos"] else vah
+                threshold = ref_vah * (1.0 + t * cfg["scale_step_pct"])
+                if close < threshold:
+                    continue
+
+                size_pct   = cfg["base_risk_pct"] * (cfg["scale_factor"] ** t)
+                order_cash = equity * size_pct
+                if order_cash < 50 or capital < order_cash:
+                    sp["tranches_done"][t] = True
+                    continue
+
+                new_shares = order_cash / close
+                if not sp["in_pos"]:
+                    sp["avg"]         = close
+                    sp["shares"]      = new_shares
+                    sp["cost"]        = order_cash
+                    sp["entry_level"] = vah
+                    sp["entry_poc"]   = poc
+                    sp["entry_exit1"] = val
+                    sp["entry_stop"]  = short_stop
+                    sp["entry_ext"]   = short_ext
+                    sp["poc_done"]    = False
+                    sp["exit1_done"]  = False
+                    sp["in_pos"]      = True
+                else:
+                    total_cost  = sp["cost"] + order_cash
+                    sp["avg"]   = (sp["avg"] * sp["shares"] + close * new_shares) / (sp["shares"] + new_shares)
+                    sp["shares"] += new_shares
+                    sp["cost"]   = total_cost
+
+                capital -= order_cash
+                sp["tranches_done"][t] = True
+                entry_markers.append({"date": date, "price": close, "level": t, "side": "short"})
+
+        lp_val = long_pos["shares"]  * close if long_pos["in_pos"]  else 0.0
+        sp_val = short_pos["shares"] * short_pos["avg"] if short_pos["in_pos"] else 0.0
+        equity_records.append({"date": date, "equity": capital + lp_val + sp_val})
+
+    # Close any open positions at last close price
+    last_close = float(raw["Close"].iloc[-1])
+    last_date  = raw.index[-1]
+    for pos, side, sign in [(long_pos, "long", 1), (short_pos, "short", -1)]:
+        if pos["in_pos"] and pos["shares"] > 0:
+            pnl = sign * (last_close - pos["avg"]) * pos["shares"]
+            capital += pos["cost"] + pnl
+            trade_records.append({"date": last_date, "side": side, "type": "expired",
+                                   "entry": pos["avg"], "exit": last_close, "pnl": pnl})
 
     equity_df = pd.DataFrame(equity_records).set_index("date")
     levels_df = pd.DataFrame(level_records).set_index("date")
     trades_df = (pd.DataFrame(trade_records)
-                 if trade_records else pd.DataFrame(columns=["pnl", "type"]))
+                 if trade_records else pd.DataFrame(columns=["pnl", "type", "side"]))
     entry_df  = pd.DataFrame(entry_markers) if entry_markers else pd.DataFrame()
     exit_df   = pd.DataFrame(exit_markers)  if exit_markers  else pd.DataFrame()
 
@@ -355,9 +424,12 @@ def compute_stats(equity_df, initial_capital, trades_df):
         win_rate = wins / total_t * 100 if total_t else 0.0
         avg_win  = float(trades_df.loc[trades_df["pnl"] > 0, "pnl"].mean() or 0)
         avg_loss = float(trades_df.loc[trades_df["pnl"] <= 0, "pnl"].mean() or 0)
+
+        long_pnl  = trades_df.loc[trades_df.get("side", pd.Series()) == "long",  "pnl"].sum() if "side" in trades_df else 0
+        short_pnl = trades_df.loc[trades_df.get("side", pd.Series()) == "short", "pnl"].sum() if "side" in trades_df else 0
     else:
         wins = total_t = 0
-        win_rate = avg_win = avg_loss = 0.0
+        win_rate = avg_win = avg_loss = long_pnl = short_pnl = 0.0
 
     return {
         "Total Return":  f"{total_r:+.1f}%",
@@ -366,6 +438,8 @@ def compute_stats(equity_df, initial_capital, trades_df):
         "Sharpe":        f"{sharpe:.2f}",
         "Trades":        str(total_t),
         "Win Rate":      f"{win_rate:.0f}%",
+        "Long PnL":      f"${long_pnl:,.0f}",
+        "Short PnL":     f"${short_pnl:,.0f}",
         "Avg Win":       f"${avg_win:,.0f}",
         "Avg Loss":      f"${avg_loss:,.0f}",
         "Final Equity":  f"${final:,.0f}",
@@ -382,9 +456,21 @@ RED  = "#f85149"
 ORG  = "#ffa657"
 GRN  = "#3fb950"
 PRP  = "#bc8cff"
+CYAN = "#39d0d8"
 
-SCALE_COLORS = [BLUE, ORG, RED, PRP, GRN]
-EXIT_COLORS  = {"stop": RED, "poc": ORG, "vah": GRN, "above": PRP}
+LONG_ENTRY_COLORS  = [BLUE, ORG, RED, PRP, GRN]
+SHORT_ENTRY_COLORS = [RED, ORG, PRP, CYAN, GRN]
+
+EXIT_COLORS = {
+    "long_stop":  RED,
+    "long_poc":   ORG,
+    "long_vah":   GRN,
+    "long_ext":   PRP,
+    "short_stop": RED,
+    "short_poc":  ORG,
+    "short_val":  CYAN,
+    "short_ext":  PRP,
+}
 
 
 def _style(ax):
@@ -398,10 +484,11 @@ def _style(ax):
     ax.grid(color=GRID, alpha=0.6, lw=0.5)
 
 
-def plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df, cfg, stats, out="backtest_results.png"):
-    fig = plt.figure(figsize=(20, 15), facecolor=BG)
+def plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df,
+                 cfg, stats, out="backtest_results.png"):
+    fig = plt.figure(figsize=(22, 16), facecolor=BG)
     gs  = GridSpec(4, 2, figure=fig,
-                   height_ratios=[3, 1, 1, 0.55],
+                   height_ratios=[3, 1, 1, 0.65],
                    hspace=0.45, wspace=0.25)
 
     ax_price  = fig.add_subplot(gs[0, 0])
@@ -420,36 +507,46 @@ def plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df, cfg, s
 
     ax_price.fill_between(levels_df.index, levels_df["val"], levels_df["vah"],
                           alpha=0.07, color=GRN, label="Value Area")
-    ax_price.plot(levels_df.index, levels_df["val"],   color=RED, lw=0.8, ls="--", alpha=0.9, label="VAL")
-    ax_price.plot(levels_df.index, levels_df["poc"],   color=ORG, lw=0.8, ls="-",  alpha=0.9, label="POC")
-    ax_price.plot(levels_df.index, levels_df["vah"],   color=GRN, lw=0.8, ls="--", alpha=0.9, label="VAH")
-    ax_price.plot(levels_df.index, levels_df["above"], color=PRP, lw=0.6, ls=":",  alpha=0.55, label="Above Target")
+    ax_price.plot(levels_df.index, levels_df["val"],       color=RED,  lw=0.8, ls="--", alpha=0.9, label="VAL")
+    ax_price.plot(levels_df.index, levels_df["poc"],       color=ORG,  lw=0.8, ls="-",  alpha=0.9, label="POC")
+    ax_price.plot(levels_df.index, levels_df["vah"],       color=GRN,  lw=0.8, ls="--", alpha=0.9, label="VAH")
+    ax_price.plot(levels_df.index, levels_df["long_ext"],  color=PRP,  lw=0.6, ls=":",  alpha=0.55, label="Long Target")
+    ax_price.plot(levels_df.index, levels_df["short_ext"], color=CYAN, lw=0.6, ls=":",  alpha=0.55, label="Short Target")
 
     if not entry_df.empty:
         for _, r in entry_df.iterrows():
-            c = SCALE_COLORS[min(int(r["level"]), len(SCALE_COLORS) - 1)]
-            ax_price.scatter(r["date"], r["price"], marker="^", s=65, color=c,
+            if r["side"] == "long":
+                c      = LONG_ENTRY_COLORS[min(int(r["level"]), len(LONG_ENTRY_COLORS) - 1)]
+                marker = "^"
+            else:
+                c      = SHORT_ENTRY_COLORS[min(int(r["level"]), len(SHORT_ENTRY_COLORS) - 1)]
+                marker = "v"
+            ax_price.scatter(r["date"], r["price"], marker=marker, s=65, color=c,
                              zorder=5, edgecolors="white", linewidths=0.4)
 
     if not exit_df.empty:
         for _, r in exit_df.iterrows():
-            ax_price.scatter(r["date"], r["price"], marker="v", s=65,
-                             color=EXIT_COLORS.get(r["type"], FG),
-                             zorder=5, edgecolors="white", linewidths=0.4)
+            is_long = r["type"].startswith("long")
+            ax_price.scatter(r["date"], r["price"],
+                             marker="D" if is_long else "D",
+                             s=55, color=EXIT_COLORS.get(r["type"], FG),
+                             zorder=5, edgecolors="white", linewidths=0.4, alpha=0.85)
 
     legend_items = [
         mpatches.Patch(color=BLUE, label="Price"),
         mpatches.Patch(color=GRN,  label="Value Area (70% vol)"),
-        mpatches.Patch(color=RED,  label="VAL / Stop exit ▼"),
-        mpatches.Patch(color=ORG,  label="POC / Scale-1 entry ▲"),
-        mpatches.Patch(color=GRN,  label="VAH exit ▼"),
-        mpatches.Patch(color=PRP,  label="Above-VAH exit ▼"),
-        mpatches.Patch(color=BLUE, label="Base entry ▲ (lvl 0)"),
+        mpatches.Patch(color=RED,  label="VAL  (long entry zone)"),
+        mpatches.Patch(color=ORG,  label="POC  (partial exit)"),
+        mpatches.Patch(color=GRN,  label="VAH  (short entry zone)"),
+        mpatches.Patch(color=PRP,  label="Long extension target"),
+        mpatches.Patch(color=CYAN, label="Short extension target"),
+        mpatches.Patch(color=BLUE, label="▲ Long entry"),
+        mpatches.Patch(color=RED,  label="▼ Short entry"),
     ]
     ax_price.legend(handles=legend_items, loc="upper left", fontsize=7,
-                    facecolor=BG, labelcolor=FG, framealpha=0.8, ncol=2)
+                    facecolor=BG, labelcolor=FG, framealpha=0.8, ncol=3)
     ax_price.set_title(
-        f"{cfg['ticker']}  ·  Volume Profile Strategy  ·  {cfg['start']} → {cfg['end']}",
+        f"{cfg['ticker']}  ·  VAL/VAH Bidirectional Strategy  ·  {cfg['start']} → {cfg['end']}",
         fontsize=11, fontweight="bold",
     )
     ax_price.set_ylabel("Price ($)")
@@ -464,7 +561,7 @@ def plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df, cfg, s
         ax_vp.barh(mids[b], vpvol[b], height=bh,
                    color=plt.cm.plasma(norm(vpvol[b])), alpha=0.85)
 
-    ax_vp.axhline(poc, color=ORG, lw=1.8, label=f"POC  ${poc:.2f}")
+    ax_vp.axhline(poc, color=ORG, lw=1.8,         label=f"POC  ${poc:.2f}")
     ax_vp.axhline(val, color=RED, lw=1.8, ls="--", label=f"VAL  ${val:.2f}")
     ax_vp.axhline(vah, color=GRN, lw=1.8, ls="--", label=f"VAH  ${vah:.2f}")
     ax_vp.set_title(f"Volume Profile — last {cfg['lookback']} bars", fontsize=10)
@@ -502,16 +599,16 @@ def plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df, cfg, s
         loc="center",
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(10)
-    tbl.scale(1, 2.4)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 2.2)
     for (row, col), cell in tbl.get_celld().items():
         cell.set_facecolor("#161b22" if row == 0 else BG)
         cell.set_edgecolor(GRID)
         cell.set_text_props(color=FG)
 
     plt.suptitle(
-        "Volume Profile Strategy  —  Long below VAL, scale in on weakness, exit at POC / VAH / extension",
-        fontsize=12, color=FG, y=1.005, fontweight="bold",
+        "VAL/VAH Bidirectional Strategy  —  Long below VAL · Short above VAH · Scale in on conviction · Exit at POC / level / extension",
+        fontsize=11, color=FG, y=1.005, fontweight="bold",
     )
 
     plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=BG)
@@ -526,32 +623,32 @@ DEFAULT_CONFIG = {
     "ticker":   "SPY",
     "start":    "2022-01-01",
     "end":      "2025-01-01",
-    "lookback": 20,          # bars in rolling volume profile window
-    "vp_bins":  100,         # price-level resolution of the volume profile
+    "lookback": 20,
+    "vp_bins":  100,
 
     # Capital
     "initial_capital": 10_000,
 
-    # Sizing — tranche 0 = base entry, tranches 1-N are scale-ins
-    # Size of tranche t  =  base_risk_pct  ×  scale_factor^t
-    "base_risk_pct":  0.05,   # 5 % of equity for the base tranche
-    "scale_step_pct": 0.01,   # add next tranche every additional 1 % below VAL
-    "scale_factor":   1.5,    # each tranche is 1.5× the base size
-    "max_scales":     4,      # maximum 4 additional tranches (5 total)
+    # Sizing
+    "base_risk_pct":  0.05,
+    "scale_step_pct": 0.01,
+    "scale_factor":   1.5,
+    "max_scales":     4,
 
-    # Exits — fractions of *remaining* shares at each level
-    "poc_exit_frac":  0.50,   # close 50 % of remaining at POC
-    "vah_exit_frac":  0.70,   # close 70 % of remainder at VAH (≈ 35 % of original)
-    # Final ~15 % exits at:
-    "above_vah_ext":  1.0,    # above_target = VAH + 1.0 × (VAH − POC)
+    # Exits
+    "poc_exit_frac":  0.50,
+    "vah_exit_frac":  0.70,
+    "above_vah_ext":  1.0,
 
     # Stop loss
-    "stop_pct": 0.03,         # stop = entry VAL × (1 − 3 %)
+    "stop_pct": 0.03,
+
+    # Direction toggle
+    "enable_short": True,
 }
 
 
 def _ask(label: str, default: str, width: int = 24) -> str:
-    """Prompt the user; return default if they press Enter or input is non-interactive."""
     try:
         answer = input(f"  {label:<{width}} [{default}]: ").strip()
         return answer if answer else default
@@ -566,12 +663,11 @@ def _parse_capital(raw: str) -> float:
 
 
 def _validate_date(s: str) -> str:
-    pd.Timestamp(s)   # raises ValueError on bad format
+    pd.Timestamp(s)
     return s
 
 
 def _interactive_config(cfg: dict) -> dict:
-    """Ask the user for the four most-common settings; all others keep defaults."""
     print("\n  Press Enter to accept the value shown in [ ].\n")
 
     while True:
@@ -618,18 +714,22 @@ def _interactive_config(cfg: dict) -> dict:
         except ValueError:
             print(f"  '{lb_str}' is not a valid integer.")
 
+    short_str = _ask("Enable short side? (y/n)", "y" if cfg["enable_short"] else "n")
+    enable_short = short_str.lower().startswith("y")
+
     cfg = cfg.copy()
-    cfg["ticker"]          = ticker
-    cfg["start"]           = start
-    cfg["end"]             = end
+    cfg["ticker"]        = ticker
+    cfg["start"]         = start
+    cfg["end"]           = end
     cfg["initial_capital"] = cap
-    cfg["lookback"]        = lb
+    cfg["lookback"]      = lb
+    cfg["enable_short"]  = enable_short
     return cfg
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Volume Profile Strategy Backtester",
+        description="VAL/VAH Bidirectional Volume Profile Strategy Backtester",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "If run with no arguments an interactive prompt lets you set\n"
@@ -637,66 +737,71 @@ def main():
             "Examples:\n"
             "  python volume_profile_strategy.py\n"
             "  python volume_profile_strategy.py --ticker AAPL --start 2020-01-01 --end 2025-01-01\n"
-            "  python volume_profile_strategy.py --ticker QQQ  --capital 50000 --lookback 10\n"
+            "  python volume_profile_strategy.py --ticker QQQ  --capital 50000 --no-short\n"
         ),
     )
-    parser.add_argument("--ticker",   default=None,  help="Ticker symbol (e.g. AAPL, QQQ, TSLA)")
-    parser.add_argument("--start",    default=None,  help="Start date YYYY-MM-DD")
-    parser.add_argument("--end",      default=None,  help="End date   YYYY-MM-DD")
-    parser.add_argument("--capital",  type=float, default=None, help="Starting capital in USD")
-    parser.add_argument("--lookback", type=int,   default=None, help="Rolling VP window in bars")
-    parser.add_argument("--out", default="backtest_results.png", help="Output chart path")
+    parser.add_argument("--ticker",    default=None,  help="Ticker symbol (e.g. AAPL, QQQ, TSLA)")
+    parser.add_argument("--start",     default=None,  help="Start date YYYY-MM-DD")
+    parser.add_argument("--end",       default=None,  help="End date   YYYY-MM-DD")
+    parser.add_argument("--capital",   type=float, default=None, help="Starting capital in USD")
+    parser.add_argument("--lookback",  type=int,   default=None, help="Rolling VP window in bars")
+    parser.add_argument("--no-short",  action="store_true",      help="Disable the short side")
+    parser.add_argument("--out",       default="backtest_results.png", help="Output chart path")
     parser.add_argument("--no-prompt", action="store_true",
                         help="Skip interactive prompt and use defaults / CLI args only")
     args = parser.parse_args()
 
     cfg = DEFAULT_CONFIG.copy()
 
-    # Apply any CLI overrides first
     if args.ticker:   cfg["ticker"]          = args.ticker.upper()
     if args.start:    cfg["start"]           = args.start
     if args.end:      cfg["end"]             = args.end
     if args.capital:  cfg["initial_capital"] = args.capital
     if args.lookback: cfg["lookback"]        = args.lookback
+    if args.no_short: cfg["enable_short"]    = False
 
-    # Show interactive prompt unless the user explicitly passed --no-prompt
-    # or supplied every key argument on the command line
     cli_fully_specified = all([args.ticker, args.start, args.end, args.capital])
     if not args.no_prompt and not cli_fully_specified:
         print("\n╔══════════════════════════════════════════════════╗")
-        print("║   Volume Profile Strategy  —  Configuration      ║")
+        print("║   VAL/VAH Bidirectional Strategy — Configuration  ║")
         print("╚══════════════════════════════════════════════════╝")
         cfg = _interactive_config(cfg)
 
-    print("\nVolume Profile Strategy Backtester")
-    print("=" * 50)
+    sides = "Long + Short" if cfg["enable_short"] else "Long only"
+    print("\nVAL/VAH Bidirectional Strategy Backtester")
+    print("=" * 52)
     print(f"  Ticker   : {cfg['ticker']}")
     print(f"  Period   : {cfg['start']} → {cfg['end']}")
     print(f"  Capital  : ${cfg['initial_capital']:,.0f}")
     print(f"  Lookback : {cfg['lookback']} bars")
+    print(f"  Sides    : {sides}")
     print(f"  Tranches : base + {cfg['max_scales']} scale-ins "
-          f"(×{cfg['scale_factor']} each, every {cfg['scale_step_pct']*100:.1f}% below VAL)")
+          f"(×{cfg['scale_factor']} each, every {cfg['scale_step_pct']*100:.1f}% outside level)")
     print(f"  Exits    : {cfg['poc_exit_frac']*100:.0f}% @ POC  ·  "
-          f"{cfg['vah_exit_frac']*100:.0f}% of remainder @ VAH  ·  rest above VAH")
-    print(f"  Stop     : {cfg['stop_pct']*100:.1f}% below entry VAL")
+          f"{cfg['vah_exit_frac']*100:.0f}% of remainder @ VAH/VAL  ·  rest at extension")
+    print(f"  Stop     : {cfg['stop_pct']*100:.1f}% beyond entry level")
 
     raw, trades_df, equity_df, levels_df, entry_df, exit_df = run_backtest(cfg)
 
     stats = compute_stats(equity_df, cfg["initial_capital"], trades_df)
 
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 52)
     print("  RESULTS")
-    print("=" * 50)
+    print("=" * 52)
     for k, v in stats.items():
         print(f"  {k:<20} {v}")
-    print("=" * 50)
+    print("=" * 52)
 
     if not trades_df.empty and "type" in trades_df.columns:
         print("\n  Exit breakdown:")
-        print(trades_df["type"].value_counts().to_string(header=False))
+        if "side" in trades_df.columns:
+            print(trades_df.groupby(["side", "type"]).size().to_string())
+        else:
+            print(trades_df["type"].value_counts().to_string(header=False))
         print()
 
-    plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df, cfg, stats, out=args.out)
+    plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df,
+                 cfg, stats, out=args.out)
 
 
 if __name__ == "__main__":
