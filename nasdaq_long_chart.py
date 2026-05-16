@@ -512,19 +512,32 @@ def plot_chart(data: pd.DataFrame, levels: pd.DataFrame,
             ), row=1, col=1)
 
     # ── Equity curve ─────────────────────────────────────────────────────────
+    init_cap = cfg["initial_capital"]
+
+    # Baseline at initial capital (fill reference)
+    fig.add_trace(go.Scatter(
+        x=eq_s.index, y=[init_cap] * len(eq_s),
+        line=dict(color="rgba(230,237,243,0.3)", width=1, dash="dash"),
+        name="Start Capital",
+        showlegend=True,
+        hovertemplate="$%{y:,.0f}<extra>Start Capital</extra>",
+    ), row=2, col=1)
+
+    # Equity fills to the baseline so the shaded area reflects P&L, not absolute value
     fig.add_trace(go.Scatter(
         x=eq_s.index, y=eq_s,
         line=dict(color=GRN, width=1.8),
-        fill="tozeroy",
-        fillcolor="rgba(63,185,80,0.10)",
+        fill="tonexty",
+        fillcolor="rgba(63,185,80,0.12)",
         name="Equity",
         hovertemplate="$%{y:,.0f}<extra>Equity</extra>",
     ), row=2, col=1)
 
-    fig.add_hline(
-        y=cfg["initial_capital"], row=2, col=1,
-        line=dict(color="rgba(230,237,243,0.3)", width=1, dash="dash"),
-    )
+    # Constrain y-axis to actual equity range so the curve isn't dwarfed by $0
+    eq_min = float(eq_s.min())
+    eq_max = float(eq_s.max())
+    pad = (eq_max - eq_min) * 0.08 or init_cap * 0.02
+    fig.update_yaxes(range=[eq_min - pad, eq_max + pad], row=2, col=1)
 
     # ── Stats annotation box ──────────────────────────────────────────────────
     stats_text = "  ".join(f"<b>{k}</b> {v}" for k, v in stats.items())
