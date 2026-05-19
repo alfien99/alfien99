@@ -923,25 +923,43 @@ def plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df,
 #    DEFAULT_CONFIG dictionary near the top of this file.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _ask(prompt: str, default, cast=str, valid=None):
+def _ask(prompt: str, default, cast=str, valid=None, required=False):
     """
     Show a prompt, wait for input, and return the validated answer.
-    If the user just presses Enter, `default` is used.
-    If `valid` is a list/set, the input must be one of those values.
-    If `cast` is int or float, the input is converted to that type.
+
+    Parameters
+    ----------
+    prompt   : the text shown to the user
+    default  : value returned if the user presses Enter with no input.
+               Ignored when required=True — the user MUST type something.
+    cast     : type to convert the raw string to (str / int / float)
+    valid    : if given, input must be one of these values
+    required : if True, pressing Enter without typing is not allowed
     """
     while True:
-        raw = input(prompt).strip()
-        if raw == "":
+        try:
+            raw = input(prompt).strip()
+        except EOFError:
+            # stdin was closed (e.g. piped input ran out) — use the default
+            print(f"  (no input — using default: {default})")
             return default
+
+        if raw == "":
+            if required:
+                print(f"  ✗  This field is required. Please type a value.")
+                continue
+            return default
+
         try:
             value = cast(raw)
         except (ValueError, TypeError):
             print(f"  ✗  Please enter a valid {cast.__name__}.")
             continue
+
         if valid is not None and value not in valid:
-            print(f"  ✗  Choose one of: {', '.join(str(v) for v in valid)}")
+            print(f"  ✗  Enter a number between {min(valid)} and {max(valid)}.")
             continue
+
         return value
 
 
@@ -957,7 +975,8 @@ def prompt_config() -> dict:
     print()
     print("╔══════════════════════════════════════════════════════════════╗")
     print("║   VAH → VAL Flip Long   ·   Interactive Setup               ║")
-    print("║   Press Enter to accept the [default].                      ║")
+    print("║   Type your answer and press Enter.                         ║")
+    print("║   Fields marked [default] accept Enter to keep that value.  ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
 
@@ -973,26 +992,35 @@ def prompt_config() -> dict:
     print()
 
     # ── Timeframe ─────────────────────────────────────────────────────────
-    # ⚙ The timeframe affects how many bars you get and how the strategy behaves.
-    #   Intraday (1m–4h): reacts fast, more trades, needs recent data
-    #   Daily/Weekly    : fewer but bigger-picture signals, longer history available
-    print("  ┌────┬──────┬───────────────────────────────────────────────────┐")
-    print("  │  # │  TF  │ Description                                       │")
-    print("  ├────┼──────┼───────────────────────────────────────────────────┤")
+    # ⚙ The timeframe controls the bar/candle size the strategy runs on.
+    #   Intraday (1m – 4h): more bars, faster signals, limited history window.
+    #   Daily / Weekly    : fewer bars, bigger-picture signals, any date range.
+    #
+    #   Tip: start with 1d (daily) to understand the strategy, then explore
+    #   intraday timeframes once you're comfortable with the results.
+    print("  ┌────┬──────┬───────────────────────────────────────────────────────┐")
+    print("  │  # │  TF  │ Description                                           │")
+    print("  ├────┼──────┼───────────────────────────────────────────────────────┤")
     for idx, key in enumerate(TIMEFRAME_ORDER, start=1):
         label = TIMEFRAME_LABELS[key]
-        print(f"  │ {idx:2d} │ {key:4s} │ {label:<49} │")
-    print("  └────┴──────┴───────────────────────────────────────────────────┘")
+        marker = " ◀ default" if key == cfg["interval"] else ""
+        print(f"  │ {idx:2d} │ {key:4s} │ {label:<49}{marker}")
+    print("  └────┴──────┴───────────────────────────────────────────────────────┘")
+    print()
 
+    # required=True means the user MUST type a number — pressing Enter alone
+    # is rejected and the prompt repeats.  The default is only used if stdin
+    # closes unexpectedly (e.g. piped input).
     default_tf_idx = TIMEFRAME_ORDER.index(cfg["interval"]) + 1
     tf_idx = _ask(
-        f"  Choose timeframe [{default_tf_idx} = {cfg['interval']}]: ",
+        f"  Type a number (1–{len(TIMEFRAME_ORDER)}) and press Enter: ",
         default=default_tf_idx, cast=int,
         valid=list(range(1, len(TIMEFRAME_ORDER) + 1)),
+        required=True,
     )
     cfg["interval"] = TIMEFRAME_ORDER[tf_idx - 1]
     tf_info = TIMEFRAME_MAP[cfg["interval"]]
-    print(f"  → Selected: {cfg['interval']}  (max history: {tf_info['max_days']} days)")
+    print(f"  ✓  Timeframe: {cfg['interval']}  (max history: {tf_info['max_days']} days)")
     print()
 
     # ── History length ────────────────────────────────────────────────────
