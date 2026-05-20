@@ -599,9 +599,25 @@ def plot(df: pd.DataFrame, trades: list, equity: list,
     lv_df = pd.DataFrame(levels).set_index("dt")
     lv_df = lv_df[lv_df.index >= plot_df.index[0]]
 
-    # ── Price line ────────────────────────────────────────────────────────────
-    ax_p.plot(plot_df.index, plot_df["Close"],
-              color=_C["blue"], lw=1.0, zorder=2)
+    # ── Candlesticks ─────────────────────────────────────────────────────────
+    if len(plot_df) > 1:
+        bar_width = (plot_df.index[1] - plot_df.index[0]).total_seconds() / 86400 * 0.7
+    else:
+        bar_width = 0.003
+    bull = plot_df["Close"] >= plot_df["Open"]
+    bear = ~bull
+    # Wicks
+    ax_p.vlines(plot_df.index[bull], plot_df["Low"][bull],  plot_df["High"][bull],
+                color=_C["green"], lw=0.6, zorder=2)
+    ax_p.vlines(plot_df.index[bear], plot_df["Low"][bear],  plot_df["High"][bear],
+                color=_C["red"],   lw=0.6, zorder=2)
+    # Bodies
+    body_bot = np.minimum(plot_df["Open"], plot_df["Close"])
+    body_ht  = np.abs(plot_df["Close"] - plot_df["Open"]).clip(lower=bar_width * 0.01)
+    ax_p.bar(plot_df.index[bull], body_ht[bull], bottom=body_bot[bull],
+             width=bar_width, color=_C["green"], zorder=3)
+    ax_p.bar(plot_df.index[bear], body_ht[bear], bottom=body_bot[bear],
+             width=bar_width, color=_C["red"],   zorder=3)
     if not lv_df.empty:
         ax_p.plot(lv_df.index, lv_df["ema"],
                   color=_C["yellow"], lw=0.9, ls="--", alpha=0.8, label="EMA")

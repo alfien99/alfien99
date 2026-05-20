@@ -245,6 +245,7 @@ def build_main_figure(df: pd.DataFrame, levels: list,
         **_base_layout(
             xaxis_rangeslider_visible=False,
             hovermode="x unified",
+            dragmode="pan",
         ),
         height=580,
     )
