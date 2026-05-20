@@ -319,15 +319,16 @@ def run_backtest(df: pd.DataFrame, cfg: dict, lookback: int):
     ema_series = df["Close"].ewm(span=ema_n, adjust=False).mean()
 
     # ── Open position state ───────────────────────────────────────────────────
-    in_pos    = False
-    direction = None      # "long" or "short"
-    shares    = 0.0
-    avg_px    = 0.0
-    cost      = 0.0       # capital tied up (returned + pnl on exit)
-    sl        = 0.0
+    in_pos     = False
+    direction  = None      # "long" or "short"
+    shares     = 0.0
+    avg_px     = 0.0
+    cost       = 0.0       # capital tied up (returned + pnl on exit)
+    sl         = 0.0
     tp1 = tp2 = tp3 = 0.0
-    tp1_done  = False
-    tp2_done  = False
+    tp1_done   = False
+    tp2_done   = False
+    entry_time = None      # timestamp of the current open entry (for trade records)
 
     trades  = []   # completed trade records
     equity  = []   # portfolio value at each bar
@@ -372,11 +373,13 @@ def run_backtest(df: pd.DataFrame, cfg: dict, lookback: int):
             if hit_sl:
                 pnl     = (sl - avg_px) * shares * sign
                 capital += cost + pnl
-                trades.append({"dt": dt, "dir": direction, "type": "stop",
-                               "entry": avg_px, "exit": sl, "pnl": pnl})
+                trades.append({"dt": dt, "entry_dt": entry_time,
+                               "dir": direction, "type": "stop",
+                               "entry": avg_px, "exit": sl, "pnl": pnl,
+                               "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3})
                 exits.append({"dt": dt, "price": sl, "type": "stop"})
                 in_pos = False; shares = cost = 0.0
-                tp1_done = tp2_done = False
+                tp1_done = tp2_done = False; entry_time = None
 
             elif hit_tp1:
                 cs      = shares * cfg["poc_exit_frac"]
@@ -399,11 +402,13 @@ def run_backtest(df: pd.DataFrame, cfg: dict, lookback: int):
             elif hit_tp3:
                 pnl     = (tp3 - avg_px) * shares * sign
                 capital += cost + pnl
-                trades.append({"dt": dt, "dir": direction, "type": "target",
-                               "entry": avg_px, "exit": tp3, "pnl": pnl})
+                trades.append({"dt": dt, "entry_dt": entry_time,
+                               "dir": direction, "type": "target",
+                               "entry": avg_px, "exit": tp3, "pnl": pnl,
+                               "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3})
                 exits.append({"dt": dt, "price": tp3, "type": "tp3"})
                 in_pos = False; shares = cost = 0.0
-                tp1_done = tp2_done = False
+                tp1_done = tp2_done = False; entry_time = None
 
         # ── SIGNAL DETECTION & ENTRY ──────────────────────────────────────────
         if not in_pos:
@@ -437,7 +442,9 @@ def run_backtest(df: pd.DataFrame, cfg: dict, lookback: int):
                     tp3    = vah_c + cfg["ext_mult"] * (vah_c - poc_c)
                     tp1_done = tp2_done = False
                     in_pos = True; direction = "long"; capital -= order
-                    entries.append({"dt": dt, "price": fill, "dir": "long"})
+                    entry_time = dt
+                    entries.append({"dt": dt, "price": fill, "dir": "long",
+                                    "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3})
 
             # ── SHORT: value area stepped DOWN ───────────────────────────────
             # new VAH is near old VAL → flipped from support to resistance.
@@ -480,7 +487,9 @@ def run_backtest(df: pd.DataFrame, cfg: dict, lookback: int):
                         tp3    = val_c - cfg["ext_mult"] * (poc_c - val_c)
                         tp1_done = tp2_done = False
                         in_pos = True; direction = "short"; capital -= order
-                        entries.append({"dt": dt, "price": fill, "dir": "short"})
+                        entry_time = dt
+                        entries.append({"dt": dt, "price": fill, "dir": "short",
+                                        "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3})
 
         equity.append(capital + shares * close)
 
