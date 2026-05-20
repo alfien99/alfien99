@@ -1,875 +1,850 @@
 #!/usr/bin/env python3
 """
-Strategy 1: VAH→VAL Flip Long Only
-====================================
-Core idea (plain English):
-  - Every period, we compute a "Volume Profile" — a histogram showing WHERE
-    most trading happened (by volume) on the price axis.
-  - The top of the 70% value area is called VAH (Value Area High).
-  - The bottom is VAL (Value Area Low).  The peak-volume price is POC.
-  - When the market steps UP so that the NEW period's VAL aligns with the
-    OLD period's VAH, that level has "flipped" from resistance → support.
-  - We buy the pullback to that flipped level, expecting buyers to defend it
-    just as they did when they first pushed price above it.
+VAH / VAL Flip Strategy  ·  Intraday
+======================================
+Long  : value area steps UP   → buy the pullback to flipped support
+          new VAL ≈ old VAH  (what was resistance is now support)
 
-Entry rules:
-  1. Compute rolling VP for the past `lookback` bars → get VAH(t)
-  2. Compute rolling VP for the past `lookback` bars ending one period back → VAH(t-1)
-  3. If |VAL(t) - VAH(t-1)| / VAH(t-1) < flip_tolerance → a flip has occurred
-  4. Enter long when close pulls back into the VAL zone (close <= VAL(t) * (1 + entry_buffer))
-  5. Only enter if price is above the 50-bar EMA (trend filter — avoids buying dips in downtrends)
-
-Exits (scaled — selling in pieces to lock in gains step by step):
-  - 50% of position at POC  (the highest-volume price — strong magnet)
-  - 70% of remainder at VAH  (top of value area — natural resistance)
-  - Rest at VAH + 1× (VAH - POC) extension  (the "stretch" target)
-  - Stop: below VAL × (1 - stop_pct)  (if it falls through support, we're wrong)
-
-Supported timeframes (--interval flag):
-  1m, 5m, 15m, 30m, 1h, 4h, 1d, 1wk
-  Note: yfinance caps intraday history (1m → 7 days, 5m/15m/30m → 60 days, 1h/4h → 730 days).
-  4H bars are built by resampling 1H data — yfinance has no native 4H feed.
+Short : value area steps DOWN  → sell the rally to flipped resistance
+          new VAH ≈ old VAL  (what was support is now resistance)
+          Shorts use a tighter flip tolerance, require a falling EMA,
+          and carry a closer stop — they are intentionally harder to trigger.
 
 Usage:
-  python vah_val_flip_long.py
-  python vah_val_flip_long.py --ticker NQ=F --interval 4h --lookback_days 180
-  python vah_val_flip_long.py --ticker SPY  --interval 1d --start 2022-01-01 --end 2025-01-01
+  python vah_val_flip_long.py          ← interactive prompt
+  python vah_val_flip_long.py --quick  ← skip prompt, run with defaults below
 """
 
-import argparse
+import sys
 import warnings
-
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.gridspec import GridSpec
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.dates as mdates
+import matplotlib.patches as mpatches
 
 warnings.filterwarnings("ignore")
 
-# ── Optional dependency: yfinance for live market data ────────────────────────
-# If not installed, the script falls back to realistic synthetic (fake) price data.
-# Install with:  pip install yfinance
 try:
     import yfinance as yf
-    _YF_AVAILABLE = True
+    _HAS_YF = True
 except ImportError:
-    _YF_AVAILABLE = False
+    _HAS_YF = False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  TIMEFRAME REGISTRY
-#  Tells the downloader which yfinance interval to request, how many calendar
-#  days of history are available, and how many bars make up one trading day.
-#  "resample" means we pull a finer feed and aggregate up to the target bar size.
-# ─────────────────────────────────────────────────────────────────────────────
-TIMEFRAME_MAP = {
-    #  key      yf interval  max history  approx bars/day  resample target
-    "1m":  {"yf": "1m",  "max_days": 7,    "bars_per_day": 390, "resample": None},
-    "5m":  {"yf": "5m",  "max_days": 60,   "bars_per_day": 78,  "resample": None},
-    "15m": {"yf": "15m", "max_days": 60,   "bars_per_day": 26,  "resample": None},
-    "30m": {"yf": "30m", "max_days": 60,   "bars_per_day": 13,  "resample": None},
-    "1h":  {"yf": "1h",  "max_days": 730,  "bars_per_day": 6,   "resample": None},
-    # yfinance has no 4H feed — download 1H and resample to 4-bar buckets
-    "4h":  {"yf": "1h",  "max_days": 730,  "bars_per_day": 2,   "resample": "4h"},
-    "1d":  {"yf": "1d",  "max_days": 3650, "bars_per_day": 1,   "resample": None},
-    "1wk": {"yf": "1wk", "max_days": 3650, "bars_per_day": 0.2, "resample": None},
+# ══════════════════════════════════════════════════════════════════════════════
+#  INTRADAY TIMEFRAME MENU
+#  ────────────────────────
+#  ⚙ Add a row here to add a new timeframe option.
+#  "yf"        → interval string Yahoo Finance accepts
+#  "max_days"  → hard history limit enforced by Yahoo Finance
+#  "lookback"  → bars per volume-profile window (≈ 2–3 intraday sessions)
+#  "resample"  → pandas offset to aggregate into (None = yfinance serves it natively)
+# ══════════════════════════════════════════════════════════════════════════════
+TIMEFRAMES = {
+    "1m":  {
+        "yf": "1m",  "max_days": 7,   "lookback": 60,
+        "resample": None,
+        "desc": "1 min   · scalping / very fast signals   (max 7 days history)",
+    },
+    "5m":  {
+        "yf": "5m",  "max_days": 60,  "lookback": 48,
+        "resample": None,
+        "desc": "5 min   · intraday momentum              (max 60 days history)",
+    },
+    "15m": {
+        "yf": "15m", "max_days": 60,  "lookback": 26,
+        "resample": None,
+        "desc": "15 min  · intraday swing                 (max 60 days history)",
+    },
+    "30m": {
+        "yf": "30m", "max_days": 60,  "lookback": 16,
+        "resample": None,
+        "desc": "30 min  · half-session swing             (max 60 days history)",
+    },
+    "1h":  {
+        "yf": "1h",  "max_days": 730, "lookback": 12,
+        "resample": None,
+        "desc": "1 hr    · multi-day swing                (max 730 days history)",
+    },
+    "4h":  {
+        "yf": "1h",  "max_days": 730, "lookback": 6,
+        "resample": "4h",
+        "desc": "4 hr    · position swing [resampled 1H]  (max 730 days history)",
+    },
+}
+_TF_KEYS = list(TIMEFRAMES.keys())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY CONFIG
+#  ────────────────
+#  All tunable parameters live here. The interactive prompt sets ticker,
+#  interval, and days_back. Everything else is changed directly in this dict.
+# ══════════════════════════════════════════════════════════════════════════════
+CFG = {
+
+    # ── Symbol & data ─────────────────────────────────────────────────────────
+    # ticker   : any Yahoo Finance symbol
+    #            Futures  → NQ=F (Nasdaq), ES=F (S&P 500), GC=F (Gold), CL=F (Oil)
+    #            Stocks   → AAPL, SPY, QQQ, TSLA, NVDA
+    # days     : calendar days of history — must respect each timeframe's max_days
+    "ticker": "NQ=F",
+    "days":   30,
+
+    # ── Volume profile ────────────────────────────────────────────────────────
+    # vp_bins : number of price buckets in the histogram
+    #           50 → fast, coarser resolution
+    #           100 → balanced (good default)
+    #           200 → very fine, slower to compute
+    "vp_bins": 50,
+
+    # ── EMA trend filter ──────────────────────────────────────────────────────
+    # Long  trades only fire when close is ABOVE the EMA.
+    # Short trades only fire when close is BELOW the EMA.
+    # ⚙ Smaller → catches trends earlier, more signals, more noise.
+    #   Larger  → fewer but cleaner trend trades only.
+    "ema_period": 20,
+
+    # ── Long entry ────────────────────────────────────────────────────────────
+    # long_flip_tol  : new VAL must be within this % of old VAH to count as a flip
+    #                  Raise it → more flips detected (noisier).
+    #                  Lower it → fewer, cleaner flips only.
+    # long_entry_buf : enter if price is within this % ABOVE VAL
+    #                  (simulates a limit order that fills on a pullback near VAL)
+    # long_stop_pct  : stop-loss placed this % BELOW VAL
+    #                  If price falls through the flip level, exit and accept the loss.
+    "long_flip_tol":  0.030,   # 3 %
+    "long_entry_buf": 0.005,   # 0.5 %
+    "long_stop_pct":  0.015,   # 1.5 %
+
+    # ── Short entry ───────────────────────────────────────────────────────────
+    # Shorts are harder to time so the rules are deliberately stricter:
+    #
+    # short_flip_tol  : tighter than long (2 % vs 3 %) — fewer shorts qualify.
+    # short_entry_buf : enter if price is within this % BELOW VAH
+    #                   (price must rally up to resistance before we sell)
+    # short_stop_pct  : tighter stop ABOVE VAH (1 % vs 1.5 % for longs)
+    #                   Shorts are cut faster to limit damage from short squeezes.
+    # short_ema_slope : True  → EMA must also be FALLING to allow a short entry.
+    #                           This is the extra strictness filter.
+    #                   False → only require price < EMA (same as long filter).
+    "short_flip_tol":  0.020,   # 2 %
+    "short_entry_buf": 0.005,   # 0.5 %
+    "short_stop_pct":  0.010,   # 1 %
+    "short_ema_slope": True,    # require confirmed declining EMA for shorts
+
+    # ── Exits (same logic for long and short, mirrored) ───────────────────────
+    # Positions are scaled out in three stages:
+    #   Stage 1 at POC     → sell/cover poc_exit_frac of position
+    #   Stage 2 at VAH/VAL → sell/cover vah_exit_frac of what remains
+    #   Stage 3 at ext     → sell/cover the rest (the "runner")
+    #
+    # ext_mult : size of the extension target relative to the VAH–POC range.
+    #   1.0 → extension = VAH + 1 × (VAH − POC) for longs  (one measured move)
+    #         extension = VAL − 1 × (POC − VAL) for shorts
+    #   Increase to hold the runner longer; decrease if extension is rarely hit.
+    "poc_exit_frac": 0.50,   # sell 50 % at POC
+    "vah_exit_frac": 0.70,   # sell 70 % of remainder at VAH (long) / VAL (short)
+    "ext_mult":      1.0,
+
+    # ── Risk & capital ────────────────────────────────────────────────────────
+    # risk_pct    : % of current capital risked on each trade.
+    #               0.005 = 0.5 %   0.01 = 1 %   0.02 = 2 %
+    #               Lower is more conservative. Start at 0.5–1 % when testing.
+    # max_pos_pct : hard cap on position size as a fraction of capital.
+    #               Prevents a very tight stop from creating a huge position.
+    # capital     : starting account size in USD.
+    "capital":     10_000,
+    "risk_pct":    0.010,
+    "max_pos_pct": 0.30,
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  DATA LAYER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """
-    Collapse finer bars into coarser bars.
-    E.g. rule="4h" turns four 1H candles into one 4H candle.
-    Aggregation rules:
-      Open  → first bar's open   (where the 4H session started)
-      High  → highest of the 4 highs  (the peak reached)
-      Low   → lowest of the 4 lows    (the trough)
-      Close → last bar's close        (where the 4H session ended)
-      Volume → sum of all bars        (total activity)
-    """
-    agg = {
-        "Open":   "first",
-        "High":   "max",
-        "Low":    "min",
-        "Close":  "last",
-        "Volume": "sum",
-    }
-    # label="right" means the timestamp on each resampled bar is its END time,
-    # closed="right" means the interval includes that boundary.
-    resampled = df.resample(rule, label="right", closed="right").agg(agg)
-    # Drop incomplete periods at the end and empty rows
-    resampled.dropna(subset=["Close"], inplace=True)
-    return resampled
+# ══════════════════════════════════════════════════════════════════════════════
+#  COLOURS  (dark theme)
+#  ⚙ Change hex codes here to restyle all charts.
+# ══════════════════════════════════════════════════════════════════════════════
+_C = {
+    "bg":     "#0d1117",
+    "panel":  "#161b22",
+    "border": "#30363d",
+    "text":   "#e6edf3",
+    "muted":  "#8b949e",
+    "green":  "#3fb950",
+    "red":    "#f85149",
+    "orange": "#ffa657",
+    "blue":   "#58a6ff",
+    "yellow": "#e3b341",
+    "purple": "#bc8cff",
+}
 
 
-def _synthetic_ohlcv(ticker: str, n_bars: int, bars_per_day: float,
-                     interval: str) -> pd.DataFrame:
-    """
-    Generate fake but realistic OHLCV data when live data isn't available.
-    Uses geometric Brownian motion (the standard academic model for stock prices)
-    with GARCH-like volatility clustering (quiet periods followed by volatile ones).
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATA
+# ══════════════════════════════════════════════════════════════════════════════
 
-    Parameters
-    ----------
-    ticker      : used to seed the random number generator so the same ticker
-                  always produces the same fake history
-    n_bars      : how many bars to create
-    bars_per_day: controls the date frequency label (e.g. 6 → hourly)
-    interval    : the timeframe string, used to pick the right pandas freq label
-    """
-    rng = np.random.default_rng(abs(hash(ticker)) % (2**31))
-    S0 = 18_000.0   # starting price
-
-    # ── Volatility clustering (GARCH-inspired) ────────────────────────────
-    # Each bar's volatility is mostly inherited from the previous bar (0.91 weight)
-    # plus a small random shock — this gives realistic "calm then stormy" periods.
-    sigma_base = 0.013
-    vols = np.full(n_bars, sigma_base)
-    for i in range(1, n_bars):
-        vols[i] = 0.91 * vols[i-1] + 0.09 * sigma_base * abs(rng.standard_normal()) + 0.001
-
-    # ── Price path (geometric Brownian motion) ────────────────────────────
-    mu = 0.0004   # slight upward drift per bar
-    closes  = S0 * np.exp(np.cumsum(rng.standard_normal(n_bars) * vols + mu))
-
-    # ── High / Low around each close ──────────────────────────────────────
-    hl      = closes * vols * 2.5   # typical high-low range per bar
-    highs   = closes + hl * rng.uniform(0.3, 0.7, n_bars)
-    lows    = closes - hl * rng.uniform(0.3, 0.7, n_bars)
-
-    # Open of each bar = close of the previous bar (no gaps in synthetic data)
-    opens   = np.roll(closes, 1)
-    opens[0] = S0
-
-    vols_v = rng.integers(1_000_000, 5_000_000, n_bars)
-
-    # Pick the right pandas frequency string for the date index
-    freq_map = {
-        "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
-        "1h": "1h",   "4h": "4h",   "1d": "B",      "1wk": "W",
-    }
-    freq = freq_map.get(interval, "B")   # "B" = business days
-
-    dates = pd.date_range(end=pd.Timestamp.now().normalize(), periods=n_bars, freq=freq)
-    df = pd.DataFrame(
-        {"Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": vols_v},
-        index=dates,
-    )
-    df.index.name = "Date"
-    return df
+def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Aggregate finer bars into coarser ones (e.g. 1H → 4H)."""
+    agg = {"Open": "first", "High": "max", "Low": "min",
+           "Close": "last", "Volume": "sum"}
+    return (df.resample(rule, label="right", closed="right")
+              .agg(agg)
+              .dropna(subset=["Close"]))
 
 
-def _download(ticker: str, start: str, end: str, interval: str) -> pd.DataFrame:
-    """
-    Fetch OHLCV data from Yahoo Finance, or fall back to synthetic data.
+def _synthetic(n: int, interval: str) -> pd.DataFrame:
+    """Generate realistic fake OHLCV when live data is unavailable."""
+    rng = np.random.default_rng(42)
+    sigma, S0 = 0.012, 18_000.0
+    v = np.full(n, sigma)
+    for i in range(1, n):
+        v[i] = 0.90 * v[i-1] + 0.10 * sigma * abs(rng.standard_normal()) + 0.001
+    c  = S0 * np.exp(np.cumsum(rng.standard_normal(n) * v + 0.0003))
+    hl = c * v * 2.2
+    h  = c + hl * rng.uniform(0.3, 0.7, n)
+    lo = c - hl * rng.uniform(0.3, 0.7, n)
+    op = np.roll(c, 1); op[0] = S0
+    vol = rng.integers(300_000, 2_000_000, n)
+    freq = {"1m": "1min", "5m": "5min", "15m": "15min",
+            "30m": "30min", "1h": "1h", "4h": "4h"}.get(interval, "5min")
+    idx = pd.date_range(end=pd.Timestamp.now().normalize(), periods=n, freq=freq)
+    return pd.DataFrame({"Open": op, "High": h, "Low": lo,
+                         "Close": c, "Volume": vol}, index=idx)
 
-    Important yfinance history limits (as of 2025):
-      1m  → only last 7 calendar days
-      5m / 15m / 30m → only last 60 calendar days
-      1h  → only last 730 calendar days (~2 years)
-      1d and above → unlimited history
-    If your start date is beyond the limit, yfinance silently returns fewer bars.
-    """
-    tf = TIMEFRAME_MAP.get(interval, TIMEFRAME_MAP["1d"])
-    yf_interval = tf["yf"]           # the interval string yfinance understands
-    resample_to = tf["resample"]     # e.g. "4h" if we need to aggregate later
-    bars_per_day = tf["bars_per_day"]
 
-    if _YF_AVAILABLE:
+def get_data(ticker: str, interval: str, days: int) -> pd.DataFrame:
+    """Download from Yahoo Finance or fall back to synthetic data."""
+    tf = TIMEFRAMES[interval]
+    days = min(days, tf["max_days"])
+
+    if _HAS_YF:
+        end   = pd.Timestamp.now()
+        start = end - pd.Timedelta(days=days)
         try:
-            print(f"  Downloading {ticker} [{interval}] from {start} to {end} …")
+            print(f"\n  Fetching {ticker} [{interval}]  "
+                  f"{start.date()} → {end.date()} …")
             raw = yf.download(
-                ticker, start=start, end=end,
-                interval=yf_interval,
-                auto_adjust=True,   # adjusts prices for splits/dividends
+                ticker,
+                start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+                interval=tf["yf"],
+                auto_adjust=True,
                 progress=False,
             )
-            # yfinance sometimes returns a MultiIndex with the ticker as second level
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.droplevel(1)
-
             raw.dropna(inplace=True)
-
-            if len(raw) > 20:
-                # Resample if we requested a timeframe yfinance doesn't serve natively
-                if resample_to:
-                    raw = _resample_ohlcv(raw, resample_to)
-                    print(f"  Resampled to {resample_to}: {len(raw)} bars.")
-                else:
-                    print(f"  Downloaded {len(raw)} bars.")
+            if len(raw) > 30:
+                if tf["resample"]:
+                    raw = _resample(raw, tf["resample"])
+                print(f"  {len(raw)} bars loaded")
                 return raw
-            else:
-                print(f"  Too few bars returned ({len(raw)}). "
-                      f"Check that --start is within the {tf['max_days']}-day limit for {interval}.")
+            print(f"  Only {len(raw)} bars returned — using synthetic data")
         except Exception as e:
-            print(f"  Yahoo Finance error ({e}) — falling back to synthetic data.")
+            print(f"  yfinance error ({e}) — using synthetic data")
 
-    # ── Synthetic fallback ─────────────────────────────────────────────────
-    print(f"  Generating synthetic OHLCV for {ticker} [{interval}] …")
-    # Estimate how many bars we need from the date range
-    try:
-        day_span = (pd.Timestamp(end) - pd.Timestamp(start)).days
-    except Exception:
-        day_span = 365
-    n_bars = max(int(day_span * bars_per_day), 200)
-    df = _synthetic_ohlcv(ticker, n_bars, bars_per_day, interval)
-    if resample_to:
-        df = _resample_ohlcv(df, resample_to)
+    bars_est = max(int(days * tf["lookback"] * 2.5), 500)
+    df = _synthetic(bars_est, interval)
+    if tf["resample"]:
+        df = _resample(df, tf["resample"])
+    print(f"  Synthetic: {len(df)} {interval} bars")
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  VOLUME PROFILE CALCULATION
-#  A Volume Profile is a horizontal histogram that answers the question:
-#  "At which price levels did the most trading volume occur during this period?"
-#
-#  Steps:
-#  1. Divide the price range into `bins` equal buckets.
-#  2. For each candle, distribute its volume across the buckets that overlap
-#     the candle's high-low range (proportional to the overlap).
-#  3. Find the POC = the bucket with the most volume.
-#  4. Expand outward from the POC until we've captured 70% of total volume.
-#     The outer edges of that 70% zone are VAL (bottom) and VAH (top).
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  VOLUME PROFILE
+#  ──────────────
+#  Returns (poc, val, vah) for a chunk of OHLCV bars.
+#    POC = price bucket with the most traded volume
+#    VAL = bottom of the 70% value area (expands outward from POC)
+#    VAH = top of the 70% value area
+# ══════════════════════════════════════════════════════════════════════════════
 
-def compute_vp(ohlcv: pd.DataFrame, bins: int = 100):
-    """
-    Compute the Volume Profile for a slice of OHLCV data.
+def compute_vp(chunk: pd.DataFrame, bins: int) -> tuple:
+    lo, hi = float(chunk["Low"].min()), float(chunk["High"].max())
+    if hi - lo < 1e-8:
+        m = (lo + hi) / 2
+        return m, m, m
 
-    Returns (poc, val, vah, price_mids, volume_per_bin):
-      poc  : Point of Control — price with the highest traded volume
-      val  : Value Area Low   — bottom of the 70% volume zone
-      vah  : Value Area High  — top of the 70% volume zone
-      mids : array of the centre price for each bin
-      vol  : array of the volume assigned to each bin
-    """
-    lo = float(ohlcv["Low"].min())
-    hi = float(ohlcv["High"].max())
+    edges = np.linspace(lo, hi, bins + 1)
+    mids  = (edges[:-1] + edges[1:]) / 2
+    vol   = np.zeros(bins)
 
-    # Edge case: flat price (no range) — return the midpoint for all levels
-    if hi <= lo + 1e-8:
-        mid = (hi + lo) / 2
-        return mid, mid, mid, np.array([mid]), np.array([1.0])
-
-    # Create `bins` equal-width price buckets between the overall low and high
-    edges = np.linspace(lo, hi, bins + 1)        # bin boundaries
-    mids  = (edges[:-1] + edges[1:]) / 2         # centre of each bucket
-    vol   = np.zeros(bins)                        # volume accumulator per bucket
-
-    for k in range(len(ohlcv)):
-        bar_hi = float(ohlcv["High"].iloc[k])
-        bar_lo = float(ohlcv["Low"].iloc[k])
-        bar_v  = float(ohlcv["Volume"].iloc[k])
-        rng    = bar_hi - bar_lo
-
-        if rng < 1e-10:
-            # Doji / zero-range bar: assign all volume to its single bucket
-            idx = min(int((bar_lo - lo) / (hi - lo) * bins), bins - 1)
-            vol[idx] += bar_v
+    for k in range(len(chunk)):
+        b_lo = float(chunk["Low"].iloc[k])
+        b_hi = float(chunk["High"].iloc[k])
+        b_v  = float(chunk["Volume"].iloc[k])
+        span = b_hi - b_lo
+        if span < 1e-10:
+            idx = min(int((b_lo - lo) / (hi - lo) * bins), bins - 1)
+            vol[idx] += b_v
         else:
-            # Spread volume proportionally across every bucket the bar overlaps.
-            # overlap[i] = how many price units of bucket i are inside [bar_lo, bar_hi]
             overlap = np.maximum(
                 0.0,
-                np.minimum(edges[1:], bar_hi) - np.maximum(edges[:-1], bar_lo)
+                np.minimum(edges[1:], b_hi) - np.maximum(edges[:-1], b_lo),
             )
-            vol += bar_v * overlap / rng
+            vol += b_v * overlap / span
 
-    # ── POC: the price bucket with the most volume ─────────────────────────
-    poc_idx = int(np.argmax(vol))
-    poc     = mids[poc_idx]
-
-    # ── Value Area: expand from POC until 70% of total volume is enclosed ──
-    # The algorithm grows the window one step at a time, always picking the
-    # side that adds more volume — this is the standard TPO / Market Profile rule.
+    poc_i  = int(np.argmax(vol))
     target = vol.sum() * 0.70
-    li = hi_i = poc_idx   # lower index / higher index (grow outward from POC)
-    acc = vol[poc_idx]    # volume accumulated so far
-
+    li = hi_i = poc_i
+    acc = vol[poc_i]
     while acc < target:
-        # Volume available if we expand one step down vs one step up
-        add_lo = vol[li   - 1] if li   > 0        else -1.0
-        add_hi = vol[hi_i + 1] if hi_i < bins - 1 else -1.0
-
-        if add_lo < 0 and add_hi < 0:
-            break   # hit both edges — we're done
-
-        # Expand toward whichever side has more volume (ties go upward)
-        if add_hi >= add_lo:
+        al = vol[li   - 1] if li   > 0        else -1.0
+        ah = vol[hi_i + 1] if hi_i < bins - 1 else -1.0
+        if al < 0 and ah < 0:
+            break
+        if ah >= al:
             hi_i += 1; acc += vol[hi_i]
         else:
             li   -= 1; acc += vol[li]
 
-    return poc, mids[li], mids[hi_i], mids, vol
+    return mids[poc_i], mids[li], mids[hi_i]   # poc, val, vah
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  BACKTEST ENGINE
-#  Walks through price bar by bar and simulates entries/exits.
-#  This is a "bar-by-bar" simulation — we only know what happened up to bar i
-#  when we make decisions at bar i.  No lookahead.
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  BACKTEST
+#  ─────────
+#  Bar-by-bar simulation. Detects flips, enters positions, manages exits.
+#  Returns trades, equity curve, VP levels (for the chart), entries, exits.
+# ══════════════════════════════════════════════════════════════════════════════
 
-def run_backtest(cfg: dict):
-    """
-    Run the VAH→VAL flip strategy on historical data described by `cfg`.
+def run_backtest(df: pd.DataFrame, cfg: dict, lookback: int):
+    bins    = cfg["vp_bins"]
+    ema_n   = cfg["ema_period"]
+    capital = float(cfg["capital"])
 
-    The "flip" concept (visualise this as a staircase going up):
-      Period t-1:  VAL────────POC────────VAH  (old value area)
-      Period t  :                 VAL────POC────VAH  (new value area shifted up)
-                                  ↑ new VAL is near old VAH → it "flipped"
+    ema_series = df["Close"].ewm(span=ema_n, adjust=False).mean()
 
-    Returns several DataFrames used by the plotting and stats functions.
-    """
-    raw      = _download(cfg["ticker"], cfg["start"], cfg["end"], cfg["interval"])
-    lookback = cfg["lookback"]   # number of bars per volume-profile window
-    bins     = cfg["vp_bins"]
-    tol      = cfg["flip_tolerance"]   # how close new VAL must be to old VAH
-    buf      = cfg["entry_buffer"]     # how far above VAL we still allow entry
-    stop_p   = cfg["stop_pct"]         # stop is X% below VAL
-    ema_win  = cfg["ema_window"]       # trend filter — only trade above this EMA
-    capital  = float(cfg["initial_capital"])
+    # ── Open position state ───────────────────────────────────────────────────
+    in_pos    = False
+    direction = None      # "long" or "short"
+    shares    = 0.0
+    avg_px    = 0.0
+    cost      = 0.0       # capital tied up (returned + pnl on exit)
+    sl        = 0.0
+    tp1 = tp2 = tp3 = 0.0
+    tp1_done  = False
+    tp2_done  = False
 
-    # ── Exponential Moving Average (trend filter) ─────────────────────────
-    # EMA gives more weight to recent bars.  We use it as a simple uptrend check:
-    # if price > EMA → uptrend → we're allowed to buy.  If price < EMA → skip.
-    ema = raw["Close"].ewm(span=ema_win, adjust=False).mean()
+    trades  = []   # completed trade records
+    equity  = []   # portfolio value at each bar
+    levels  = []   # VP levels at each bar (for chart)
+    entries = []   # entry markers  (for chart)
+    exits   = []   # exit markers   (for chart)
 
-    # ── Trade-state variables ─────────────────────────────────────────────
-    in_pos     = False   # are we currently holding a position?
-    shares     = 0.0     # how many units we own
-    avg_px     = 0.0     # average price we paid
-    cost       = 0.0     # total cash tied up in the position (shares × avg_px)
-    entry_stop = 0.0     # the stop-loss price level for this trade
-    entry_poc  = 0.0     # the POC target level for the first partial exit
-    entry_vah  = 0.0     # the VAH target level for the second partial exit
-    entry_ext  = 0.0     # the extension target for the final exit
-    poc_done   = False   # have we already taken profits at the POC?
-    vah_done   = False   # have we already taken profits at the VAH?
+    min_i = lookback * 2 + ema_n   # bars needed before first signal is possible
 
-    # ── Output containers ─────────────────────────────────────────────────
-    equity_records = []   # running portfolio value at each bar
-    level_records  = []   # VP levels at each bar (for plotting)
-    trade_records  = []   # completed trades (for stats)
-    entry_marks    = []   # dates/prices of entries (for chart markers)
-    exit_marks     = []   # dates/prices of exits  (for chart markers)
-    flip_marks     = []   # dates/prices where a flip was detected
+    for i in range(len(df)):
+        bar   = df.iloc[i]
+        close = float(bar["Close"])
+        high  = float(bar["High"])
+        low   = float(bar["Low"])
+        dt    = df.index[i]
 
-    # We need at least 2× lookback bars of history before the first signal is valid
-    min_i = max(lookback * 2, ema_win + 5)
+        # Compute VP levels only once we have enough history
+        if i < min_i:
+            equity.append(capital + shares * close)
+            continue
 
-    for i in range(min_i, len(raw)):
-        date  = raw.index[i]
-        close = float(raw["Close"].iloc[i])
-        high  = float(raw["High"].iloc[i])
-        low   = float(raw["Low"].iloc[i])
+        poc_c, val_c, vah_c = compute_vp(df.iloc[i - lookback     : i], bins)
+        poc_p, val_p, vah_p = compute_vp(df.iloc[i - lookback * 2 : i - lookback], bins)
+        ema_v = float(ema_series.iloc[i])
 
-        # ── Compute Volume Profiles ───────────────────────────────────────
-        # "Current" period: the most recent `lookback` bars ending now
-        poc_c, val_c, vah_c, _, _ = compute_vp(raw.iloc[i - lookback : i], bins)
-        # "Previous" period: the `lookback` bars before the current period
-        poc_p, val_p, vah_p, _, _ = compute_vp(raw.iloc[i - lookback * 2 : i - lookback], bins)
+        levels.append({"dt": dt, "poc": poc_c, "val": val_c,
+                       "vah": vah_c, "ema": ema_v})
 
-        # ── Flip Detection ────────────────────────────────────────────────
-        # A "flip" means the value area has stepped up:
-        #   Condition 1: current VAL is higher than previous VAL (market moved up)
-        #   Condition 2: current VAL is close to (or above) previous VAH
-        #                (the new floor is where the old ceiling was)
-        val_above_prev_val = val_c > val_p
-        near_prev_vah = (
-            (vah_p > 0 and abs(val_c - vah_p) / vah_p < tol)   # within tolerance %
-            or val_c >= vah_p                                    # or already above it
-        )
-        flip = val_above_prev_val and near_prev_vah
-
-        # Trend filter: only trade when price is above its EMA (we're in an uptrend)
-        uptrend = close > float(ema.iloc[i])
-
-        # ── Compute trade levels for this bar ─────────────────────────────
-        # Stop-loss: placed just below the current VAL
-        # If price falls here, the flip level failed and we exit to limit losses
-        stop_lvl = val_c * (1 - stop_p)
-
-        # Extension target: beyond VAH, sized as one times the VAH-to-POC distance
-        # This is like a "measured move" — if price broke VAH, it could travel that far again
-        ext_lvl = vah_c + cfg["ext_mult"] * (vah_c - poc_c)
-
-        # Save levels for plotting
-        level_records.append({
-            "date": date, "poc": poc_c, "val": val_c, "vah": vah_c,
-            "vah_prev": vah_p, "flip": flip, "ema": float(ema.iloc[i]),
-        })
-        if flip:
-            flip_marks.append({"date": date, "level": val_c})
-
-        # ── EXIT LOGIC (checked before entry to avoid same-bar in-and-out) ──
+        # ── EXIT LOGIC ────────────────────────────────────────────────────────
         if in_pos:
-            if low <= entry_stop:
-                # ── Stop-loss hit ─────────────────────────────────────────
-                # The flip level broke down — take the loss and move on
-                pnl     = (entry_stop - avg_px) * shares
-                capital += cost + pnl   # return the cash (with loss deducted)
-                trade_records.append({
-                    "date": date, "type": "stop",
-                    "entry": avg_px, "exit": entry_stop, "pnl": pnl,
-                })
-                exit_marks.append({"date": date, "price": entry_stop, "type": "stop"})
+            is_long  = direction == "long"
+            hit_sl   = (is_long and low  <= sl) or (not is_long and high >= sl)
+            hit_tp1  = not tp1_done and (
+                (is_long and high >= tp1) or (not is_long and low <= tp1))
+            hit_tp2  = tp1_done and not tp2_done and (
+                (is_long and high >= tp2) or (not is_long and low <= tp2))
+            hit_tp3  = tp2_done and shares > 0 and (
+                (is_long and high >= tp3) or (not is_long and low <= tp3))
+
+            sign = 1.0 if is_long else -1.0   # profit direction multiplier
+
+            if hit_sl:
+                pnl     = (sl - avg_px) * shares * sign
+                capital += cost + pnl
+                trades.append({"dt": dt, "dir": direction, "type": "stop",
+                               "entry": avg_px, "exit": sl, "pnl": pnl})
+                exits.append({"dt": dt, "price": sl, "type": "stop"})
                 in_pos = False; shares = cost = 0.0
-                poc_done = vah_done = False
+                tp1_done = tp2_done = False
 
-            elif not poc_done and high >= entry_poc:
-                # ── First partial exit at POC (50% of position) ──────────
-                # POC is the highest-volume price — strong magnet and natural target
-                cs       = shares * cfg["poc_exit_frac"]
-                pnl_p    = (entry_poc - avg_px) * cs
-                capital += cs * avg_px + pnl_p   # return cash + profit
-                cost    -= cs * avg_px            # reduce cost basis
-                shares  -= cs
-                poc_done = True
-                exit_marks.append({"date": date, "price": entry_poc, "type": "poc"})
-
-            elif poc_done and not vah_done and high >= entry_vah:
-                # ── Second partial exit at VAH (70% of remaining) ────────
-                # Top of the value area — where sellers tend to re-emerge
-                cs       = shares * cfg["vah_exit_frac"]
-                pnl_p    = (entry_vah - avg_px) * cs
+            elif hit_tp1:
+                cs      = shares * cfg["poc_exit_frac"]
+                pnl_p   = (tp1 - avg_px) * cs * sign
                 capital += cs * avg_px + pnl_p
                 cost    -= cs * avg_px
                 shares  -= cs
-                vah_done = True
-                exit_marks.append({"date": date, "price": entry_vah, "type": "vah"})
+                tp1_done = True
+                exits.append({"dt": dt, "price": tp1, "type": "tp1"})
 
-            elif vah_done and shares > 0 and high >= entry_ext:
-                # ── Final exit at extension target (the "runner") ─────────
-                # The remaining small piece is held for the full measured move
-                pnl     = (entry_ext - avg_px) * shares
+            elif hit_tp2:
+                cs      = shares * cfg["vah_exit_frac"]
+                pnl_p   = (tp2 - avg_px) * cs * sign
+                capital += cs * avg_px + pnl_p
+                cost    -= cs * avg_px
+                shares  -= cs
+                tp2_done = True
+                exits.append({"dt": dt, "price": tp2, "type": "tp2"})
+
+            elif hit_tp3:
+                pnl     = (tp3 - avg_px) * shares * sign
                 capital += cost + pnl
-                trade_records.append({
-                    "date": date, "type": "target",
-                    "entry": avg_px, "exit": entry_ext, "pnl": pnl,
-                })
-                exit_marks.append({"date": date, "price": entry_ext, "type": "ext"})
+                trades.append({"dt": dt, "dir": direction, "type": "target",
+                               "entry": avg_px, "exit": tp3, "pnl": pnl})
+                exits.append({"dt": dt, "price": tp3, "type": "tp3"})
                 in_pos = False; shares = cost = 0.0
-                poc_done = vah_done = False
+                tp1_done = tp2_done = False
 
-        # ── ENTRY LOGIC ───────────────────────────────────────────────────
-        # All four conditions must be true:
-        #   1. Not already in a trade
-        #   2. A VAH→VAL flip is active
-        #   3. We are in an uptrend (price > EMA)
-        #   4. This bar's LOW touched the VAL zone (the pullback arrived)
-        entry_px = val_c * (1 + buf)   # the limit order price — VAL + small buffer
-        if (
-            not in_pos
-            and flip
-            and uptrend
-            and low  <= entry_px       # bar dipped into the VAL zone
-            and close > stop_lvl       # but didn't blow through the stop already
-        ):
-            # ── Position sizing (fixed-fraction risk) ─────────────────────
-            # We risk exactly `risk_pct` of current capital on every trade.
-            # size = (dollars_at_risk) / (price_from_entry_to_stop)
-            fill_px     = min(close, entry_px)   # simulate a limit order fill
-            risk_cash   = capital * cfg["risk_pct"]
-            risk_per_sh = max(fill_px - stop_lvl, 1e-6)
-            n_sh        = risk_cash / risk_per_sh
-            # Also cap position at `max_position_pct` of capital (diversification guard)
-            order_cash  = min(n_sh * fill_px, capital * cfg["max_position_pct"])
+        # ── SIGNAL DETECTION & ENTRY ──────────────────────────────────────────
+        if not in_pos:
 
-            if order_cash >= 50 and capital >= order_cash:   # minimum viable trade
-                shares     = n_sh
-                avg_px     = fill_px
-                cost       = order_cash
-                entry_stop = stop_lvl
-                entry_poc  = poc_c
-                entry_vah  = vah_c
-                entry_ext  = ext_lvl
-                poc_done   = vah_done = False
-                in_pos     = True
-                capital   -= order_cash
-                entry_marks.append({"date": date, "price": fill_px})
+            # ── LONG: value area stepped UP ──────────────────────────────────
+            # new VAL is near old VAH → flipped from resistance to support
+            # Enter when price pulls BACK DOWN into VAL after the break above.
+            long_flip = (
+                (val_c > val_p) and
+                (vah_p > 0) and
+                (abs(val_c - vah_p) / vah_p < cfg["long_flip_tol"]
+                 or val_c >= vah_p)
+            )
+            entry_long = val_c * (1 + cfg["long_entry_buf"])
+            stop_long  = val_c * (1 - cfg["long_stop_pct"])
 
-        # Track portfolio value (cash + mark-to-market value of open position)
-        equity_records.append({"date": date, "equity": capital + shares * close})
+            if (long_flip
+                    and close > ema_v           # price is above EMA → uptrend
+                    and low   <= entry_long     # this bar touched the VAL zone
+                    and close >  stop_long):    # but didn't break through the stop
+                fill      = min(close, entry_long)
+                risk_cash = capital * cfg["risk_pct"]
+                risk_pts  = max(fill - stop_long, 1e-6)
+                n_sh      = risk_cash / risk_pts
+                order     = min(n_sh * fill, capital * cfg["max_pos_pct"])
+                if order >= 10 and capital >= order:
+                    shares = n_sh; avg_px = fill; cost = order
+                    sl     = stop_long
+                    tp1    = poc_c
+                    tp2    = vah_c
+                    tp3    = vah_c + cfg["ext_mult"] * (vah_c - poc_c)
+                    tp1_done = tp2_done = False
+                    in_pos = True; direction = "long"; capital -= order
+                    entries.append({"dt": dt, "price": fill, "dir": "long"})
 
-    # ── Close any open position at end of data ("mark to market") ─────────
+            # ── SHORT: value area stepped DOWN ───────────────────────────────
+            # new VAH is near old VAL → flipped from support to resistance.
+            # Enter when price RALLIES BACK UP into VAH after the break below.
+            #
+            # Extra strictness vs long:
+            #   1. Tighter flip tolerance (short_flip_tol < long_flip_tol)
+            #   2. EMA must be FALLING (not just price below EMA)
+            if not in_pos:
+                ema_falling = (
+                    float(ema_series.iloc[i])
+                    < float(ema_series.iloc[max(0, i - ema_n)])
+                )
+                short_ok = (close < ema_v) and (
+                    not cfg["short_ema_slope"] or ema_falling
+                )
+                short_flip = (
+                    (vah_c < vah_p) and
+                    (val_p > 0) and
+                    (abs(vah_c - val_p) / val_p < cfg["short_flip_tol"]
+                     or vah_c <= val_p)
+                )
+                entry_short = vah_c * (1 - cfg["short_entry_buf"])
+                stop_short  = vah_c * (1 + cfg["short_stop_pct"])
+
+                if (short_flip
+                        and short_ok              # price below falling EMA
+                        and high  >= entry_short  # this bar touched the VAH zone
+                        and close <  stop_short): # but didn't blow through the stop
+                    fill      = max(close, entry_short)
+                    risk_cash = capital * cfg["risk_pct"]
+                    risk_pts  = max(stop_short - fill, 1e-6)
+                    n_sh      = risk_cash / risk_pts
+                    order     = min(n_sh * fill, capital * cfg["max_pos_pct"])
+                    if order >= 10 and capital >= order:
+                        shares = n_sh; avg_px = fill; cost = order
+                        sl     = stop_short
+                        tp1    = poc_c
+                        tp2    = val_c
+                        tp3    = val_c - cfg["ext_mult"] * (poc_c - val_c)
+                        tp1_done = tp2_done = False
+                        in_pos = True; direction = "short"; capital -= order
+                        entries.append({"dt": dt, "price": fill, "dir": "short"})
+
+        equity.append(capital + shares * close)
+
+    # Mark open position to market at final bar
     if in_pos and shares > 0:
-        lp  = float(raw["Close"].iloc[-1])
-        pnl = (lp - avg_px) * shares
+        lp  = float(df["Close"].iloc[-1])
+        pnl = (lp - avg_px) * shares * (1.0 if direction == "long" else -1.0)
         capital += cost + pnl
-        trade_records.append({
-            "date": raw.index[-1], "type": "expired",
-            "entry": avg_px, "exit": lp, "pnl": pnl,
-        })
+        trades.append({"dt": df.index[-1], "dir": direction, "type": "open",
+                       "entry": avg_px, "exit": lp, "pnl": pnl})
 
-    # ── Package results into DataFrames ───────────────────────────────────
-    equity_df = pd.DataFrame(equity_records).set_index("date")
-    levels_df = pd.DataFrame(level_records).set_index("date")
-    trades_df = (
-        pd.DataFrame(trade_records)
-        if trade_records
-        else pd.DataFrame(columns=["pnl", "type"])
-    )
-    entry_df = pd.DataFrame(entry_marks) if entry_marks else pd.DataFrame()
-    exit_df  = pd.DataFrame(exit_marks)  if exit_marks  else pd.DataFrame()
-    flip_df  = pd.DataFrame(flip_marks)  if flip_marks  else pd.DataFrame()
-
-    return raw, trades_df, equity_df, levels_df, entry_df, exit_df, flip_df
+    return trades, equity, levels, entries, exits
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PERFORMANCE STATISTICS
-#  Summarise what the backtest achieved in a few key numbers.
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  STATISTICS
+# ══════════════════════════════════════════════════════════════════════════════
 
-def compute_stats(equity_df: pd.DataFrame, initial_capital: float,
-                  trades_df: pd.DataFrame) -> dict:
-    """
-    Calculate standard trading performance metrics.
+def compute_stats(trades: list, equity: list, capital: float) -> dict:
+    if not trades or not equity:
+        return {}
 
-    Total Return   : (final value − starting value) / starting value × 100
-    Annualised Return : what the total return would be if held for exactly 1 year
-    Max Drawdown   : the worst peak-to-trough loss during the test period
-    Sharpe Ratio   : risk-adjusted return; >1 is decent, >2 is very good
-    Win Rate       : % of closed trades that made money
-    """
-    final   = float(equity_df["equity"].iloc[-1])
-    total_r = (final - initial_capital) / initial_capital * 100
+    eq   = pd.Series(equity)
+    final = float(eq.iloc[-1])
+    ret   = (final - capital) / capital * 100
 
-    # Annualise: compound the total return to a per-year rate
-    n_days  = max((equity_df.index[-1] - equity_df.index[0]).days, 1)
-    ann_r   = ((final / initial_capital) ** (365 / n_days) - 1) * 100
+    peak  = eq.cummax()
+    dd    = float(((eq - peak) / peak * 100).min())
 
-    # Max drawdown: how far below the previous peak did equity fall?
-    roll_max = equity_df["equity"].cummax()
-    max_dd   = float(((equity_df["equity"] - roll_max) / roll_max * 100).min())
+    dr    = eq.pct_change().dropna()
+    sharpe = dr.mean() / dr.std() * (252 ** 0.5) if dr.std() > 0 else 0.0
 
-    # Sharpe: mean daily return divided by its standard deviation, scaled to yearly
-    daily_r = equity_df["equity"].pct_change().dropna()
-    sharpe  = daily_r.mean() / daily_r.std() * (252 ** 0.5) if daily_r.std() > 0 else 0.0
+    t  = pd.DataFrame(trades)
+    # Only count completed trades (stop + target), exclude still-open marks
+    closed = t[t["type"].isin(["stop", "target"])] if "type" in t.columns else t
 
-    if not trades_df.empty and "pnl" in trades_df.columns:
-        wins     = int((trades_df["pnl"] > 0).sum())
-        total_t  = len(trades_df)
-        win_rate = wins / total_t * 100 if total_t else 0.0
-        avg_win  = float(trades_df.loc[trades_df["pnl"] > 0,  "pnl"].mean() or 0)
-        avg_loss = float(trades_df.loc[trades_df["pnl"] <= 0, "pnl"].mean() or 0)
-    else:
-        total_t = wins = 0
-        win_rate = avg_win = avg_loss = 0.0
+    def _side(direction):
+        s  = closed[closed["dir"] == direction] if "dir" in closed.columns else pd.DataFrame()
+        if s.empty:
+            return {"trades": 0, "wins": 0, "wr": "—", "avg_win": "—", "avg_loss": "—"}
+        wins = int((s["pnl"] > 0).sum())
+        n    = len(s)
+        return {
+            "trades":   n,
+            "wins":     wins,
+            "wr":       f"{wins/n*100:.0f}%",
+            "avg_win":  f"${s.loc[s.pnl>0,'pnl'].mean():,.0f}"  if wins   else "—",
+            "avg_loss": f"${s.loc[s.pnl<=0,'pnl'].mean():,.0f}" if wins<n else "—",
+        }
 
     return {
-        "Total Return":  f"{total_r:+.1f}%",
-        "Ann. Return":   f"{ann_r:+.1f}%",
-        "Max Drawdown":  f"{max_dd:.1f}%",
-        "Sharpe":        f"{sharpe:.2f}",
-        "Trades":        str(total_t),
-        "Win Rate":      f"{win_rate:.0f}%",
-        "Avg Win":       f"${avg_win:,.0f}",
-        "Avg Loss":      f"${avg_loss:,.0f}",
-        "Final Equity":  f"${final:,.0f}",
+        "Return":      f"{ret:+.1f}%",
+        "Max DD":      f"{dd:.1f}%",
+        "Sharpe":      f"{sharpe:.2f}",
+        "Long trades": _side("long")["trades"],
+        "Long WR":     _side("long")["wr"],
+        "Short trades":_side("short")["trades"],
+        "Short WR":    _side("short")["wr"],
+        "Final equity":f"${final:,.0f}",
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  CHART
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Dark-theme colour palette
-BG, GRID, FG   = "#0d1117", "#21262d", "#e6edf3"
-BLUE, RED, ORG = "#58a6ff", "#f85149", "#ffa657"
-GRN,  PRP, YLW = "#3fb950", "#bc8cff", "#e3b341"
-
-
-def _style(ax):
-    """Apply dark-theme styling to a single Axes object."""
-    ax.set_facecolor(BG)
-    ax.tick_params(colors=FG, labelsize=8)
-    for s in ax.spines.values():
-        s.set_edgecolor(GRID)
-    ax.xaxis.label.set_color(FG)
-    ax.yaxis.label.set_color(FG)
-    ax.title.set_color(FG)
-    ax.grid(color=GRID, alpha=0.6, lw=0.5)
+def _style_ax(ax):
+    ax.set_facecolor(_C["panel"])
+    ax.tick_params(colors=_C["muted"], labelsize=8)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(_C["border"])
+    ax.grid(color=_C["border"], alpha=0.5, lw=0.4)
 
 
-def plot_results(raw, trades_df, equity_df, levels_df, entry_df, exit_df,
-                 flip_df, cfg: dict, stats: dict, out: str = "flip_long_results.png"):
+def plot(df: pd.DataFrame, trades: list, equity: list,
+         levels: list, entries: list, exits: list,
+         cfg: dict, stats: dict, interval: str, out: str):
     """
-    Produce a 4-panel chart:
-      Panel 1 (top, large): Price with VP levels, flip zones, and trade markers
-      Panel 2 (middle):     Equity curve showing portfolio growth over time
-      Panel 3 (lower):      Drawdown chart — how far below peak equity fell
-      Panel 4 (bottom):     Stats table
+    3-row chart:
+      Row 0 — Price line + EMA + rolling VAH/POC/VAL + trade markers
+      Row 1 — Volume bars
+      Row 2 — Equity curve + drawdown
+    ⚙ Change figsize or height_ratios to resize the panels.
     """
-    fig = plt.figure(figsize=(20, 15), facecolor=BG)
-    gs  = GridSpec(4, 1, figure=fig, height_ratios=[3, 1, 1, 0.55], hspace=0.42)
-    ax_p, ax_eq, ax_dd, ax_st = [fig.add_subplot(gs[i]) for i in range(4)]
-    for ax in (ax_p, ax_eq, ax_dd, ax_st):
-        _style(ax)
-
-    # ── Panel 1: Price chart ───────────────────────────────────────────────
-    # Align the price series to the same dates we computed VP levels for
-    sl = raw.loc[levels_df.index]
-    ax_p.plot(sl.index, sl["Close"], color=BLUE, lw=1.0, label="Price")
-    ax_p.plot(
-        levels_df.index, levels_df["ema"],
-        color=YLW, lw=0.9, ls="--", alpha=0.7,
-        label=f"EMA({cfg['ema_window']}) — trend filter",
+    plt.style.use("dark_background")
+    fig = plt.figure(figsize=(20, 12), facecolor=_C["bg"])
+    gs  = gridspec.GridSpec(
+        3, 1, figure=fig,
+        height_ratios=[4, 1, 1.5],
+        hspace=0.10,
+        left=0.05, right=0.97, top=0.93, bottom=0.06,
     )
+    ax_p  = fig.add_subplot(gs[0])
+    ax_v  = fig.add_subplot(gs[1], sharex=ax_p)
+    ax_eq = fig.add_subplot(gs[2], sharex=ax_p)
+    for ax in (ax_p, ax_v, ax_eq):
+        _style_ax(ax)
 
-    # Shade the value area (VAL to VAH) with a faint green band
-    ax_p.fill_between(levels_df.index, levels_df["val"], levels_df["vah"],
-                      alpha=0.07, color=GRN)
-    ax_p.plot(levels_df.index, levels_df["val"], color=RED, lw=0.8, ls="--",
-              alpha=0.9, label="VAL (Value Area Low)")
-    ax_p.plot(levels_df.index, levels_df["poc"], color=ORG, lw=0.8, ls="-",
-              alpha=0.9, label="POC (Point of Control)")
-    ax_p.plot(levels_df.index, levels_df["vah"], color=GRN, lw=0.8, ls="--",
-              alpha=0.9, label="VAH (Value Area High)")
+    # ── Restrict to recent bars so intraday charts stay readable ──────────────
+    # ⚙ Change 350 to show more or fewer bars on the price panel.
+    SHOW_BARS = 350
+    if len(df) > SHOW_BARS:
+        plot_df = df.iloc[-SHOW_BARS:]
+    else:
+        plot_df = df
 
-    # Highlight each bar where a flip was detected with a yellow horizontal band
-    for _, r in levels_df[levels_df["flip"]].iterrows():
-        ax_p.axhspan(r["val"] * 0.998, r["val"] * 1.002, alpha=0.18, color=YLW)
+    lv_df = pd.DataFrame(levels).set_index("dt")
+    lv_df = lv_df[lv_df.index >= plot_df.index[0]]
 
-    # Plot entry triangles (green △) and exit diamonds (coloured by exit type)
-    if not entry_df.empty:
-        ax_p.scatter(
-            entry_df["date"], entry_df["price"],
-            marker="^", s=80, color=GRN, zorder=5,
-            edgecolors="white", lw=0.4, label="Long entry",
-        )
-    if not exit_df.empty:
-        exit_colours = {"stop": RED, "poc": ORG, "vah": GRN, "ext": PRP}
-        for _, r in exit_df.iterrows():
-            ax_p.scatter(
-                r["date"], r["price"],
-                marker="D", s=55, zorder=5,
-                color=exit_colours.get(r["type"], FG),
-                edgecolors="white", lw=0.4,
-            )
+    # ── Price line ────────────────────────────────────────────────────────────
+    ax_p.plot(plot_df.index, plot_df["Close"],
+              color=_C["blue"], lw=1.0, zorder=2)
+    if not lv_df.empty:
+        ax_p.plot(lv_df.index, lv_df["ema"],
+                  color=_C["yellow"], lw=0.9, ls="--", alpha=0.8, label="EMA")
+        ax_p.plot(lv_df.index, lv_df["vah"],
+                  color=_C["green"],  lw=0.8, ls="--", alpha=0.85, label="VAH")
+        ax_p.plot(lv_df.index, lv_df["poc"],
+                  color=_C["orange"], lw=0.8, ls="-",  alpha=0.85, label="POC")
+        ax_p.plot(lv_df.index, lv_df["val"],
+                  color=_C["red"],    lw=0.8, ls="--", alpha=0.85, label="VAL")
+        # Shade value area
+        ax_p.fill_between(lv_df.index, lv_df["val"], lv_df["vah"],
+                          alpha=0.05, color=_C["blue"])
 
-    ax_p.legend(
-        handles=[
-            mpatches.Patch(color=BLUE, label="Price"),
-            mpatches.Patch(color=YLW,  label=f"EMA({cfg['ema_window']}) trend filter"),
-            mpatches.Patch(color=RED,  label="VAL"),
-            mpatches.Patch(color=ORG,  label="POC"),
-            mpatches.Patch(color=GRN,  label="VAH"),
-            mpatches.Patch(color=YLW,  alpha=0.4, label="Flip zone (VAH→VAL)"),
-            mpatches.Patch(color=GRN,  label="▲ Entry at flipped VAL"),
-            mpatches.Patch(color=RED,  label="◆ Stop exit"),
-            mpatches.Patch(color=ORG,  label="◆ POC partial exit"),
-            mpatches.Patch(color=PRP,  label="◆ Extension target"),
-        ],
-        loc="upper left", fontsize=7, facecolor=BG, labelcolor=FG,
-        framealpha=0.8, ncol=3,
-    )
+    # ── Trade markers ─────────────────────────────────────────────────────────
+    for e in entries:
+        if e["dt"] < plot_df.index[0]:
+            continue
+        color  = _C["green"] if e["dir"] == "long" else _C["red"]
+        marker = "^" if e["dir"] == "long" else "v"
+        ax_p.scatter(e["dt"], e["price"], marker=marker, s=90,
+                     color=color, zorder=6, edgecolors=_C["bg"], lw=0.5)
+
+    exit_colors = {
+        "stop": _C["red"], "tp1": _C["orange"],
+        "tp2": _C["green"], "tp3": _C["purple"],
+    }
+    for x in exits:
+        if x["dt"] < plot_df.index[0]:
+            continue
+        ax_p.scatter(x["dt"], x["price"], marker="D", s=45, zorder=6,
+                     color=exit_colors.get(x["type"], _C["text"]),
+                     edgecolors=_C["bg"], lw=0.4)
+
+    ax_p.set_xlim(plot_df.index[0], plot_df.index[-1])
+    ax_p.set_ylim(plot_df["Low"].min() * 0.999,
+                  plot_df["High"].max() * 1.001)
+
+    ax_p.legend(handles=[
+        mpatches.Patch(color=_C["blue"],   label="Price"),
+        mpatches.Patch(color=_C["yellow"], label=f"EMA({cfg['ema_period']})"),
+        mpatches.Patch(color=_C["green"],  label="VAH"),
+        mpatches.Patch(color=_C["orange"], label="POC"),
+        mpatches.Patch(color=_C["red"],    label="VAL"),
+        mpatches.Patch(color=_C["green"],  label="▲ Long entry"),
+        mpatches.Patch(color=_C["red"],    label="▼ Short entry"),
+        mpatches.Patch(color=_C["red"],    label="◆ Stop"),
+        mpatches.Patch(color=_C["purple"], label="◆ Extension exit"),
+    ], loc="upper left", fontsize=7, facecolor=_C["panel"],
+       labelcolor=_C["text"], framealpha=0.9, ncol=3)
+
     ax_p.set_title(
-        f"{cfg['ticker']}  [{cfg['interval']}]  ·  VAH→VAL Flip Long  ·  "
-        f"{cfg['start']} → {cfg['end']}",
-        fontsize=11, fontweight="bold",
+        f"{cfg['ticker']}  [{interval}]  ·  VAH/VAL Flip  ·  "
+        f"Long ▲  /  Short ▼  (showing last {len(plot_df)} bars)",
+        color=_C["text"], fontsize=11, fontweight="bold", pad=8,
     )
-    ax_p.set_ylabel("Price ($)")
+    ax_p.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+    plt.setp(ax_p.get_xticklabels(), visible=False)
 
-    # ── Panel 2: Equity curve ──────────────────────────────────────────────
-    eq = equity_df["equity"]
-    ax_eq.plot(eq.index, eq, color=GRN, lw=1.5)
-    ax_eq.axhline(cfg["initial_capital"], color=FG, lw=0.7, ls="--", alpha=0.3)
-    # Green fill above starting capital = profit; red fill below = loss
-    ax_eq.fill_between(eq.index, cfg["initial_capital"], eq,
-                       where=eq >= cfg["initial_capital"], color=GRN, alpha=0.12)
-    ax_eq.fill_between(eq.index, cfg["initial_capital"], eq,
-                       where=eq <  cfg["initial_capital"], color=RED, alpha=0.12)
-    ax_eq.set_title("Equity Curve", fontsize=10)
-    ax_eq.set_ylabel("Equity ($)")
+    # ── Volume bars ───────────────────────────────────────────────────────────
+    bull = plot_df["Close"] >= plot_df["Open"]
+    ax_v.bar(plot_df.index,
+             plot_df["Volume"],
+             color=np.where(bull, _C["green"], _C["red"]),
+             alpha=0.6, width=0.6 / (len(plot_df) / 100))
+    ax_v.set_ylabel("Volume", color=_C["muted"], fontsize=8)
+    ax_v.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"{x/1e6:.1f}M"))
+    plt.setp(ax_v.get_xticklabels(), visible=False)
 
-    # ── Panel 3: Drawdown ──────────────────────────────────────────────────
-    # Drawdown = how far equity has fallen below its all-time high at each point
-    rm  = eq.cummax()                        # running maximum (all-time high)
-    ddp = (eq - rm) / rm * 100              # percentage below the peak
-    ax_dd.fill_between(ddp.index, ddp, 0, color=RED, alpha=0.55)
-    ax_dd.plot(ddp.index, ddp, color=RED, lw=0.8)
-    ax_dd.set_title("Drawdown (%)", fontsize=10)
-    ax_dd.set_ylabel("DD %")
+    # ── Equity + drawdown ─────────────────────────────────────────────────────
+    if equity:
+        eq_s = pd.Series(equity, index=df.index[-len(equity):])
+        ax_eq.plot(eq_s.index, eq_s, color=_C["green"], lw=1.5)
+        ax_eq.axhline(cfg["capital"], color=_C["muted"], lw=0.7, ls="--", alpha=0.5)
+        ax_eq.fill_between(eq_s.index, cfg["capital"], eq_s,
+                           where=eq_s >= cfg["capital"],
+                           color=_C["green"], alpha=0.10)
+        ax_eq.fill_between(eq_s.index, cfg["capital"], eq_s,
+                           where=eq_s < cfg["capital"],
+                           color=_C["red"], alpha=0.15)
 
-    # ── Panel 4: Stats table ───────────────────────────────────────────────
-    ax_st.axis("off")
-    tbl = ax_st.table(
-        cellText=[list(stats.values())],
-        colLabels=list(stats.keys()),
-        cellLoc="center", loc="center",
-    )
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(9)
-    tbl.scale(1, 2.2)
-    for (r, c), cell in tbl.get_celld().items():
-        cell.set_facecolor("#161b22" if r == 0 else BG)
-        cell.set_edgecolor(GRID)
-        cell.set_text_props(color=FG)
+        # Overlay drawdown as a faint red fill on the right y-axis
+        ax_dd = ax_eq.twinx()
+        peak  = eq_s.cummax()
+        dd    = (eq_s - peak) / peak * 100
+        ax_dd.fill_between(eq_s.index, dd, 0, color=_C["red"], alpha=0.18)
+        ax_dd.plot(eq_s.index, dd, color=_C["red"], lw=0.6, alpha=0.6)
+        ax_dd.set_ylabel("DD %", color=_C["red"], fontsize=7)
+        ax_dd.tick_params(colors=_C["red"], labelsize=7)
+        ax_dd.set_ylim(dd.min() * 1.5, 5)
+        for sp in ax_dd.spines.values():
+            sp.set_edgecolor(_C["border"])
 
-    plt.suptitle(
-        "Strategy 1: VAH→VAL Flip Long  —  Buy the level that was once resistance, now confirmed support",
-        fontsize=11, color=FG, y=1.005, fontweight="bold",
-    )
-    plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=BG)
-    print(f"  Chart saved → {out}")
+    ax_eq.set_ylabel("Equity", color=_C["muted"], fontsize=8)
+    ax_eq.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax_eq.xaxis.set_major_formatter(mdates.DateFormatter("%d %b %H:%M"))
+    ax_eq.tick_params(axis="x", rotation=20, labelsize=7)
+
+    # ── Stats text block ──────────────────────────────────────────────────────
+    if stats:
+        lines = [f"{k}: {v}" for k, v in stats.items()]
+        ax_eq.text(
+            0.99, 0.97, "\n".join(lines),
+            transform=ax_eq.transAxes,
+            color=_C["text"], fontsize=7.5, fontfamily="monospace",
+            va="top", ha="right",
+            bbox=dict(facecolor=_C["panel"], edgecolor=_C["border"],
+                      alpha=0.9, pad=5),
+        )
+
+    plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=_C["bg"])
+    print(f"\n  Chart saved → {out}")
     plt.show()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  DEFAULT CONFIGURATION
-#  Change these values to tune the strategy.
-#  You can also override most of them via command-line flags (see --help).
-# ─────────────────────────────────────────────────────────────────────────────
-DEFAULT_CONFIG = {
-    # ── Data settings ────────────────────────────────────────────────────
-    "ticker":   "SPY",
-    "interval": "1d",          # timeframe: 1m 5m 15m 30m 1h 4h 1d 1wk
-    "start":    "2022-01-01",
-    "end":      "2025-01-01",
+# ══════════════════════════════════════════════════════════════════════════════
+#  INTERACTIVE PROMPT
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # ── Volume Profile settings ───────────────────────────────────────────
-    "lookback": 20,            # bars per VP window (adjust for your timeframe)
-    "vp_bins":  100,           # price buckets in the histogram (more = finer detail)
-
-    # ── Capital & risk ────────────────────────────────────────────────────
-    "initial_capital":  10_000,
-    "risk_pct":         0.02,  # risk 2% of portfolio per trade
-    "max_position_pct": 0.40,  # never put more than 40% of capital in one trade
-
-    # ── Strategy parameters ───────────────────────────────────────────────
-    "ema_window":      50,     # trend filter: only trade when close > this EMA
-    "flip_tolerance":  0.03,   # new VAL must be within 3% of old VAH to count as a flip
-    "entry_buffer":    0.005,  # enter when price is up to 0.5% above VAL
-    "stop_pct":        0.015,  # stop-loss is 1.5% below VAL
-
-    # ── Exit fractions ────────────────────────────────────────────────────
-    "poc_exit_frac": 0.50,     # sell 50% when price reaches POC
-    "vah_exit_frac": 0.70,     # sell 70% of remainder when price reaches VAH
-    "ext_mult":      1.0,      # extension target = VAH + 1× (VAH − POC)
-}
-
-# ── Sensible per-timeframe lookback defaults ──────────────────────────────────
-# Shorter bars need more bars to represent the same "one session" of market activity
-LOOKBACK_DEFAULTS = {
-    "1m": 120, "5m": 48, "15m": 32, "30m": 20,
-    "1h": 16,  "4h": 8,  "1d": 20,  "1wk": 12,
-}
+def _input(prompt: str, default=None, cast=str, choices=None, required=False):
+    """Prompt the user, validate, and return the answer (or default on Enter)."""
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except EOFError:
+            return default
+        if not raw:
+            if required:
+                print("  ✗  Required — please type a value.")
+                continue
+            return default
+        try:
+            val = cast(raw)
+        except (ValueError, TypeError):
+            print(f"  ✗  Expected a {cast.__name__}.")
+            continue
+        if choices is not None and val not in choices:
+            print(f"  ✗  Enter a number between {min(choices)} and {max(choices)}.")
+            continue
+        return val
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main():
-    # ── Command-line argument parser ─────────────────────────────────────
-    # Lets you run the script with custom settings without editing the file:
-    #   python vah_val_flip_long.py --ticker QQQ --interval 1h --lookback_days 180
-    p = argparse.ArgumentParser(
-        description="VAH→VAL Flip Long Strategy backtester",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python vah_val_flip_long.py
-  python vah_val_flip_long.py --interval 4h --lookback_days 400
-  python vah_val_flip_long.py --ticker NQ=F --interval 1h --start 2023-06-01 --end 2024-12-01
-  python vah_val_flip_long.py --ticker SPY  --interval 1d --start 2020-01-01 --end 2025-01-01
-
-Supported intervals:
-  1m  (last 7 days only)   5m  (last 60 days)   15m (last 60 days)
-  30m (last 60 days)       1h  (last 730 days)   4h  (last 730 days, resampled)
-  1d  (unlimited history)  1wk (unlimited history)
-        """,
-    )
-    p.add_argument("--ticker",       default=None,
-                   help="Yahoo Finance ticker symbol, e.g. SPY, NQ=F, AAPL")
-    p.add_argument("--interval",     default=None,
-                   choices=list(TIMEFRAME_MAP.keys()),
-                   help="Bar timeframe (default: 1d)")
-    p.add_argument("--start",        default=None,
-                   help="Start date YYYY-MM-DD (must be within interval's history limit)")
-    p.add_argument("--end",          default=None,
-                   help="End date YYYY-MM-DD (default: today)")
-    p.add_argument("--lookback_days", type=int, default=None,
-                   help="Calendar days of history to fetch (overrides --start/--end)")
-    p.add_argument("--capital",      type=float, default=None,
-                   help="Starting capital in USD")
-    p.add_argument("--lookback",     type=int,   default=None,
-                   help="Bars per volume-profile window")
-    p.add_argument("--out",          default="flip_long_results.png",
-                   help="Output filename for the chart image")
-    args = p.parse_args()
-
-    # ── Build config: start from defaults then apply any CLI overrides ────
-    cfg = DEFAULT_CONFIG.copy()
-    if args.ticker:   cfg["ticker"]   = args.ticker.upper()
-    if args.interval: cfg["interval"] = args.interval
-    if args.capital:  cfg["initial_capital"] = args.capital
-
-    # If the user gave a lookback_days, compute start/end from today
-    if args.lookback_days:
-        end_dt   = pd.Timestamp.now().normalize()
-        start_dt = end_dt - pd.Timedelta(days=args.lookback_days)
-        cfg["start"] = start_dt.strftime("%Y-%m-%d")
-        cfg["end"]   = end_dt.strftime("%Y-%m-%d")
-    else:
-        if args.start: cfg["start"] = args.start
-        if args.end:   cfg["end"]   = args.end
-
-    # Auto-select a sensible VP lookback window if not explicitly provided
-    if args.lookback:
-        cfg["lookback"] = args.lookback
-    else:
-        cfg["lookback"] = LOOKBACK_DEFAULTS.get(cfg["interval"], 20)
-
-    # Warn if the requested date range exceeds yfinance's limit for this interval
-    tf_info   = TIMEFRAME_MAP.get(cfg["interval"], TIMEFRAME_MAP["1d"])
-    max_days  = tf_info["max_days"]
-    req_days  = (pd.Timestamp(cfg["end"]) - pd.Timestamp(cfg["start"])).days
-    if req_days > max_days:
-        print(f"  ⚠ WARNING: {cfg['interval']} data is only available for the last "
-              f"{max_days} days, but you requested {req_days} days.")
-        print(f"    yfinance will silently return less data than requested.")
-
-    # ── Print run summary ─────────────────────────────────────────────────
-    print("\nVAH→VAL Flip Long Strategy")
-    print("=" * 50)
-    print(f"  Ticker       : {cfg['ticker']}")
-    print(f"  Interval     : {cfg['interval']}")
-    print(f"  Period       : {cfg['start']} → {cfg['end']}")
-    print(f"  Capital      : ${cfg['initial_capital']:,.0f}")
-    print(f"  VP lookback  : {cfg['lookback']} bars")
-    print(f"  Flip tol.    : {cfg['flip_tolerance']*100:.1f}%")
-    print(f"  EMA filter   : {cfg['ema_window']}-bar")
-    print(f"  Risk/trade   : {cfg['risk_pct']*100:.1f}%")
-    print(f"  Stop         : {cfg['stop_pct']*100:.1f}% below VAL")
-
-    # ── Run backtest ──────────────────────────────────────────────────────
-    raw, trades_df, equity_df, levels_df, entry_df, exit_df, flip_df = run_backtest(cfg)
-    stats = compute_stats(equity_df, cfg["initial_capital"], trades_df)
-
-    # ── Print results ─────────────────────────────────────────────────────
-    print("\n" + "=" * 50)
-    for k, v in stats.items():
-        print(f"  {k:<20} {v}")
-    print("=" * 50)
-
-    if not trades_df.empty and "type" in trades_df.columns:
-        print("\n  Exit breakdown:")
-        print(trades_df["type"].value_counts().to_string(header=False))
+def prompt_settings(cfg: dict) -> tuple[str, str, int]:
+    """
+    Ask the user for ticker, timeframe, and days of history.
+    Returns (ticker, interval, days).
+    """
+    print()
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║   VAH / VAL Flip  ·  Intraday Strategy Setup        ║")
+    print("╚══════════════════════════════════════════════════════╝")
     print()
 
-    # ── Plot ──────────────────────────────────────────────────────────────
-    plot_results(
-        raw, trades_df, equity_df, levels_df, entry_df, exit_df,
-        flip_df, cfg, stats, out=args.out,
+    # ── Ticker ────────────────────────────────────────────────────────────────
+    print("  Ticker  (Yahoo Finance symbol)")
+    print("  Futures: NQ=F  ES=F  GC=F  CL=F")
+    print("  Stocks : AAPL  SPY   QQQ   TSLA")
+    ticker = _input(f"  → [{cfg['ticker']}]: ", default=cfg["ticker"]).upper()
+    print()
+
+    # ── Timeframe ─────────────────────────────────────────────────────────────
+    print("  Timeframe")
+    print(f"  {'#':>2}   {'TF':<5}  Description")
+    print(f"  {'─'*60}")
+    for i, key in enumerate(_TF_KEYS, 1):
+        default_tag = " ◀" if key == "5m" else ""
+        print(f"  {i:>2}   {key:<5}  {TIMEFRAMES[key]['desc']}{default_tag}")
+    print()
+
+    # User MUST type a number — pressing Enter alone is rejected
+    n = _input(
+        f"  → type 1–{len(_TF_KEYS)} and press Enter: ",
+        default=None, cast=int,
+        choices=list(range(1, len(_TF_KEYS) + 1)),
+        required=True,
     )
+    interval = _TF_KEYS[n - 1]
+    tf       = TIMEFRAMES[interval]
+    print(f"  ✓  {interval}  —  {tf['desc']}")
+    print()
+
+    # ── Days of history ───────────────────────────────────────────────────────
+    max_d   = tf["max_days"]
+    default_d = min(cfg["days"], max_d)
+    print(f"  Days of history  (max for {interval}: {max_d})")
+    days = _input(
+        f"  → [{default_d}]: ",
+        default=default_d, cast=int,
+    )
+    days = max(5, min(days, max_d))
+    print(f"  ✓  {days} days")
+    print()
+
+    return ticker, interval, days
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    quick = "--quick" in sys.argv   # skip prompt, run with CFG defaults
+
+    if quick:
+        ticker   = CFG["ticker"]
+        interval = "5m"
+        days     = CFG["days"]
+        print(f"\n  Quick mode — {ticker} [{interval}]  {days} days")
+    else:
+        ticker, interval, days = prompt_settings(CFG)
+
+    tf       = TIMEFRAMES[interval]
+    lookback = tf["lookback"]
+
+    # Override CFG with prompted values
+    cfg          = CFG.copy()
+    cfg["ticker"] = ticker
+    cfg["days"]   = days
+
+    # Fetch data
+    df = get_data(ticker, interval, days)
+    if df.empty or len(df) < lookback * 2 + cfg["ema_period"] + 5:
+        print("  Not enough data to run the strategy. Try a longer date range.")
+        return
+
+    # Run backtest
+    print(f"  Running backtest  ({len(df)} bars, lookback={lookback}) …")
+    trades, equity, levels, entries, exits = run_backtest(df, cfg, lookback)
+
+    # Stats
+    stats = compute_stats(trades, equity, cfg["capital"])
+    print()
+    print("  ── Results " + "─" * 40)
+    for k, v in stats.items():
+        print(f"  {k:<18} {v}")
+
+    if trades:
+        t = pd.DataFrame(trades)
+        if "dir" in t.columns and "type" in t.columns:
+            print()
+            print("  ── Exit breakdown by direction " + "─" * 20)
+            for d in ("long", "short"):
+                sub = t[(t["dir"] == d) & (t["type"].isin(["stop", "target"]))]
+                if not sub.empty:
+                    print(f"  {d.capitalize()}: "
+                          + sub["type"].value_counts().to_string(index=True, header=False))
+
+    # Chart
+    out = f"flip_{ticker.lower().replace('=', '')}_{interval}.png"
+    plot(df, trades, equity, levels, entries, exits, cfg, stats, interval, out)
 
 
 if __name__ == "__main__":
