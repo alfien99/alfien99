@@ -614,66 +614,10 @@ def show_trade_detail(hover):
 #  PROMPT & MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _ask(prompt, default=None, cast=str, choices=None, required=False):
-    while True:
-        try:
-            raw = input(prompt).strip()
-        except EOFError:
-            return default
-        if not raw:
-            if required:
-                print("  Required — type a value.")
-                continue
-            return default
-        try:
-            val = cast(raw)
-        except (ValueError, TypeError):
-            print(f"  Expected a {cast.__name__}.")
-            continue
-        if choices and val not in choices:
-            print(f"  Choose between {min(choices)} and {max(choices)}.")
-            continue
-        return val
-
-
 def main():
-    quick = "--quick" in sys.argv
-
-    if quick:
-        ticker, interval, days = S.CFG["ticker"], "5m", S.CFG["days"]
-    else:
-        print()
-        print("╔══════════════════════════════════════════════╗")
-        print("║   VAH/VAL Flip · Interactive Trade Viewer   ║")
-        print("╚══════════════════════════════════════════════╝")
-        print()
-        print("  These settings pre-load the chart at startup.")
-        print("  You can change them again using the controls in the browser.")
-        print()
-
-        print("  Ticker  (e.g. NQ=F  ES=F  SPY  AAPL)")
-        ticker = _ask(f"  → [{S.CFG['ticker']}]: ", default=S.CFG["ticker"]).upper()
-        print()
-
-        keys = list(S.TIMEFRAMES.keys())
-        print("  Timeframe")
-        for i, k in enumerate(keys, 1):
-            tag = " ◀" if k == "5m" else ""
-            print(f"  {i:>2}   {k:<5}  {S.TIMEFRAMES[k]['desc']}{tag}")
-        print()
-        n        = _ask(f"  → 1–{len(keys)}: ", default=2, cast=int,
-                        choices=list(range(1, len(keys)+1)), required=True)
-        interval = keys[n - 1]
-        tf       = S.TIMEFRAMES[interval]
-        print(f"  ✓  {interval}  (max {tf['max_days']} days)")
-        print()
-
-        days = _ask(
-            f"  Days of history  [max {tf['max_days']}]: ",
-            default=min(S.CFG["days"], tf["max_days"]), cast=int,
-        )
-        days = max(5, min(days, tf["max_days"]))
-        print()
+    ticker   = S.CFG["ticker"]
+    interval = "5m"
+    days     = S.CFG["days"]
 
     # Pre-load data so the chart is ready immediately when the browser opens
     print(f"\n  Pre-loading {ticker} [{interval}] {days}d …")
