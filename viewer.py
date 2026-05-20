@@ -231,6 +231,15 @@ def build_main_figure(df: pd.DataFrame, levels: list,
         hovertemplate="%{x}<br>Vol: %{y:,.0f}<extra></extra>",
     ), row=2, col=1)
 
+    # ── Default view: last 200 bars so candlesticks are immediately visible ───
+    INITIAL_BARS = 200
+    if len(df) > INITIAL_BARS:
+        x_start = df.index[-INITIAL_BARS]
+        x_end   = df.index[-1]
+    else:
+        x_start = df.index[0]
+        x_end   = df.index[-1]
+
     # ── Layout ────────────────────────────────────────────────────────────────
     fig.update_layout(
         **_base_layout(
@@ -250,6 +259,7 @@ def build_main_figure(df: pd.DataFrame, levels: list,
     fig.update_xaxes(
         gridcolor=BORDER, zerolinecolor=BORDER,
         rangeslider_visible=False,
+        range=[x_start, x_end],
     )
     # Range selector buttons at the top of the x-axis
     fig.update_xaxes(
@@ -436,6 +446,8 @@ app.layout = html.Div(
                                     "displayModeBar": True,
                                     "modeBarButtonsToRemove": ["autoScale2d"],
                                     "toImageButtonOptions": {"format": "png", "scale": 2},
+                                    "doubleClick": "reset",
+                                    "showTips": False,
                                 },
                                 style={"height": "580px"},
                             ),
