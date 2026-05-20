@@ -2,3 +2,5 @@ yfinance>=0.2.40
 pandas>=2.0
 numpy>=1.24
 matplotlib>=3.7
+dash>=2.14
+plotly>=5.18
